@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+sqlmodel
+psycopg2-binary
+python-jose[cryptography]
+passlib[bcrypt]==1.7.4
+bcrypt==3.2.2
+python-multipart
+aiofiles
+firebase-admin
+google-cloud-storage
+email-validator
+alembic

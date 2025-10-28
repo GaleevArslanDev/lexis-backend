@@ -1,0 +1,61 @@
+# ----------------------
+# Python
+# ----------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.pdb
+*.egg-info/
+*.egg
+*.env
+*.venv
+env/
+venv/
+ENV/
+
+*.gitignore
+
+# ----------------------
+# IDEs
+# ----------------------
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ----------------------
+# Logs & coverage
+# ----------------------
+*.log
+.pytest_cache/
+.coverage
+
+# ----------------------
+# Database
+# ----------------------
+*.db
+*.sqlite3
+
+# ----------------------
+# Migrations
+# ----------------------
+migrations/versions/  # Alembic/SQLModel auto-generated migration scripts (optional: can commit)
+
+# ----------------------
+# Docker
+# ----------------------
+*.env                 # Environment variables with secrets
+docker-compose.override.yml
+
+# ----------------------
+# Pydantic / SQLModel
+# ----------------------
+*.pkl                 # Serialized files, caches
+
+# ----------------------
+# OS-specific
+# ----------------------
+.DS_Store
+Thumbs.db
