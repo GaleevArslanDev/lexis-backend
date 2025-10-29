@@ -4,7 +4,7 @@ from ..db import get_session
 from ..schemas import AssignmentCreate
 from ..crud.assignment import create_assignment as crud_create_assignment
 from ..crud.logs import log_action
-from ..dependencies import require_role, get_current_user
+from ..dependencies_util import require_role, get_current_user
 from ..models import Assignment, User, Class, ClassStudentLink
 
 router = APIRouter(prefix="/assignments", tags=["assignments"])

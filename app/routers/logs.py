@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlmodel import Session
 from datetime import datetime
 from ..db import get_session
-from ..dependencies import get_current_user, require_role
+from ..dependencies_util import get_current_user, require_role
 from ..crud.logs import get_logs_for_user_with_count, get_all_logs
 from fastapi import Query
 

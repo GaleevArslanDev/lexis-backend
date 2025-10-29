@@ -21,7 +21,11 @@ class UserRead(BaseModel):
 
 class Token(BaseModel):
     access_token: str
-    token_type: str = "bearer"
+    token_type: str
+    jti: str | None = None
+
+    class Config:
+        from_attributes = True
 
 
 class ClassCreate(BaseModel):
@@ -65,3 +69,7 @@ class SchoolCreate(BaseModel):
 class SchoolUpdate(BaseModel):
     name: Optional[str] = None
     address: Optional[str] = None
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str

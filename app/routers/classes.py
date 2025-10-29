@@ -3,7 +3,7 @@ from ..db import get_session
 from ..crud.classes import *
 from ..crud.logs import log_action
 from ..models import User, ClassStudentLink, Class
-from ..dependencies import require_role, get_current_user
+from ..dependencies_util import require_role, get_current_user
 from ..schemas import ClassCreate, ClassUpdate
 
 router = APIRouter(prefix="/classes", tags=["classes"])

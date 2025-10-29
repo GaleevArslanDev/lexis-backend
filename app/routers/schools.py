@@ -5,7 +5,7 @@ from ..crud.school import *
 from ..crud.logs import log_action
 from typing import Optional
 from ..models import School, User
-from ..dependencies import require_role
+from ..dependencies_util import require_role
 from ..schemas import SchoolUpdate, SchoolCreate
 
 router = APIRouter(prefix="/schools", tags=["schools"])

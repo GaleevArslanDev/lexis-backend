@@ -111,3 +111,19 @@ class ActionLog(SQLModel, table=True):
     target_id: int
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     details: str | None = None
+
+
+class RefreshToken(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id")
+    token: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    expires_at: datetime
+
+
+class RevokedToken(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    jti: str = Field(index=True, unique=True)
+    user_id: int = Field(index=True)
+    revoked_at: datetime = Field(default_factory=datetime.utcnow)
+    expired: bool = Field(default=True)
