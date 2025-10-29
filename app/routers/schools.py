@@ -3,23 +3,12 @@ from sqlmodel import Session, select
 from ..db import get_session
 from ..crud.school import *
 from ..crud.logs import log_action
-from pydantic import BaseModel
 from typing import Optional
 from ..models import School, User
 from ..dependencies import require_role
+from ..schemas import SchoolUpdate, SchoolCreate
 
 router = APIRouter(prefix="/schools", tags=["schools"])
-
-
-# Pydantic схемы
-class SchoolCreate(BaseModel):
-    name: str
-    address: Optional[str] = None
-
-
-class SchoolUpdate(BaseModel):
-    name: Optional[str] = None
-    address: Optional[str] = None
 
 
 @router.post("/", response_model=dict)
