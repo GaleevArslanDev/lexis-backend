@@ -11,6 +11,8 @@ class ClassStudentLink(SQLModel, table=True):
 class User(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     email: str = Field(index=True, nullable=False, unique=True)
+    name: str = Field(nullable=False)
+    surname: str = Field(nullable=False)
     hashed_password: str
     role: str = Field(default="teacher")  # 'teacher' or 'student'
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -114,16 +116,17 @@ class ActionLog(SQLModel, table=True):
 
 
 class RefreshToken(SQLModel, table=True):
-    id: int | None = Field(default=None, primary_key=True)
+    id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="user.id")
     token: str
+    jti: Optional[str] = Field(index=True, nullable=True)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     expires_at: datetime
 
 
 class RevokedToken(SQLModel, table=True):
-    id: int | None = Field(default=None, primary_key=True)
+    id: Optional[int] = Field(default=None, primary_key=True)
     jti: str = Field(index=True, unique=True)
-    user_id: int = Field(index=True)
+    user_id: Optional[int] = Field(index=True, default=None, nullable=True)
+    token_type: Optional[str] = None  # "access" or "refresh"
     revoked_at: datetime = Field(default_factory=datetime.utcnow)
-    expired: bool = Field(default=True)

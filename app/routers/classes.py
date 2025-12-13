@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from ..db import get_session
 from ..crud.classes import *
 from ..crud.logs import log_action
-from ..models import User, ClassStudentLink, Class
+from ..models import User, ClassStudentLink, Class, Assignment
 from ..dependencies_util import require_role, get_current_user
 from ..schemas import ClassCreate, ClassUpdate
 
@@ -156,3 +156,54 @@ def list_classes_by_school(school_id: int, session: Session = Depends(get_sessio
     classes = get_classes_by_school(session, school_id)
     return [{"id": c.id, "name": c.name, "teacher_id": c.teacher_id} for c in classes]
 
+
+@router.get("/{class_id}/students", response_model=list[dict])
+def list_students_in_class(
+    class_id: int,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(require_role("teacher"))
+):
+    klass = session.get(Class, class_id)
+    if not klass:
+        raise HTTPException(status_code=404, detail="Class not found")
+    if klass.teacher_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You cannot view students of this class")
+
+    links = session.exec(
+        select(ClassStudentLink).where(ClassStudentLink.class_id == class_id)
+    ).all()
+    student_ids = [link.student_id for link in links]
+    if not student_ids:
+        return []
+
+    students = session.exec(select(User).where(User.id.in_(student_ids))).all()
+    return [{"id": s.id, "email": s.email, "role": s.role} for s in students]
+
+
+@router.get("/{class_id}/assignments", response_model=list[dict])
+def get_class_assignments(
+    class_id: int,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user)
+):
+    klass = session.get(Class, class_id)
+    if not klass:
+        raise HTTPException(status_code=404, detail="Class not found")
+
+    # Учитель может видеть только свои классы, а ученик — только те, где он состоит
+    if current_user.role == "teacher" and klass.teacher_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You cannot view assignments of this class")
+    elif current_user.role == "student":
+        link = session.exec(
+            select(ClassStudentLink).where(
+                ClassStudentLink.class_id == class_id,
+                ClassStudentLink.student_id == current_user.id
+            )
+        ).first()
+        if not link:
+            raise HTTPException(status_code=403, detail="You are not in this class")
+
+    assignments = session.exec(
+        select(Assignment).where(Assignment.class_id == class_id)
+    ).all()
+    return [{"id": a.id, "title": a.title, "class_id": a.class_id} for a in assignments]

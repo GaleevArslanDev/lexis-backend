@@ -57,6 +57,8 @@ def delete_assignment(assignment_id: int, session: Session = Depends(get_session
     assignment = session.get(Assignment, assignment_id)
     if not assignment:
         raise HTTPException(404, "Assignment not found")
+    if assignment.class_.teacher_id != current_user.id:
+        raise HTTPException(403, "You cannot delete this assignment")
     session.delete(assignment)
     session.commit()
 

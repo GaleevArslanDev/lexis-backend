@@ -5,6 +5,8 @@ from datetime import datetime
 
 class UserCreate(BaseModel):
     email: EmailStr
+    name: str
+    surname: str
     password: str
     role: Optional[str] = "teacher"
 
@@ -12,6 +14,8 @@ class UserCreate(BaseModel):
 class UserRead(BaseModel):
     id: int
     email: EmailStr
+    name: str
+    surname: str
     role: str
     created_at: datetime
 

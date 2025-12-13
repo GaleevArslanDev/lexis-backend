@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from .db import init_db
-from .routers import auth, classes, assignments, files, ai, schools, reports, logs
+from .routers import auth, classes, assignments, files, ai, schools, reports, logs, users
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Лексис - backend")
@@ -21,6 +21,7 @@ app.include_router(ai.router)
 app.include_router(schools.router)
 app.include_router(reports.router)
 app.include_router(logs.router)
+app.include_router(users.router)
 
 
 @app.on_event("startup")

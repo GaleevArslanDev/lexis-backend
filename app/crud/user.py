@@ -2,8 +2,8 @@ from sqlmodel import select
 from ..models import User
 
 
-def create_user(session, email: str, hashed_password: str, role: str = "teacher"):
-    user = User(email=email, hashed_password=hashed_password, role=role)
+def create_user(session, name:str, surname:str, email: str, hashed_password: str, role: str = "teacher"):
+    user = User(email=email, surname=surname, name=name, hashed_password=hashed_password, role=role)
     session.add(user)
     session.commit()
     session.refresh(user)
