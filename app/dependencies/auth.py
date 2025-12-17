@@ -9,6 +9,7 @@ from typing import Optional
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_session)) -> User:
+    """Получить текущего пользователя по токену"""
     payload = decode_token(token)
     if payload is None:
         raise HTTPException(

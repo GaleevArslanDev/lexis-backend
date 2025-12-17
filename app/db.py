@@ -1,5 +1,8 @@
 from sqlmodel import SQLModel, create_engine, Session
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 DB_USER = os.getenv("POSTGRES_USER", "lexis_user")
 DB_PASS = os.getenv("POSTGRES_PASSWORD", "lexis_pass")
@@ -12,9 +15,17 @@ engine = create_engine(DATABASE_URL, echo=False, future=True)
 
 
 def init_db():
-    SQLModel.metadata.create_all(engine)
+    """Инициализация базы данных - создает все таблицы"""
+    try:
+        print("Creating database tables...")
+        SQLModel.metadata.create_all(engine)
+        print("Database tables created successfully!")
+    except Exception as e:
+        print(f"Error creating database tables: {e}")
+        raise
 
 
 def get_session():
+    """Получить сессию базы данных"""
     with Session(engine) as session:
         yield session
