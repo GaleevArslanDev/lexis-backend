@@ -16,13 +16,7 @@ engine = create_engine(DATABASE_URL, echo=False, future=True)
 
 def init_db():
     """Инициализация базы данных - создает все таблицы"""
-    try:
-        print("Creating database tables...")
-        SQLModel.metadata.create_all(engine)
-        print("Database tables created successfully!")
-    except Exception as e:
-        print(f"Error creating database tables: {e}")
-        raise
+    pass
 
 
 def get_session():
