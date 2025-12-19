@@ -3,7 +3,7 @@ __version__ = "2.0.0"
 __author__ = "Lexis Team"
 
 # Импортируем основные модули для удобства
-from .db import, get_session, engine
+from .db import get_session, engine
 from .models import *
 from .schemas import *
 
@@ -12,7 +12,6 @@ from .main import app
 
 __all__ = [
     "app",
-    "init_db",
     "get_session",
     "engine",
     "SQLModel",
