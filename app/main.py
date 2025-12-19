@@ -1,5 +1,4 @@
 from fastapi import FastAPI
-from .db import init_db
 from .routers import auth, classes, assignments, files, ai, schools, reports, logs, users, assessit
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -33,8 +32,6 @@ app.include_router(assessit.router)  # Новый роутер для AssessIt
 
 @app.on_event("startup")
 def on_startup():
-    init_db()
-
     # Создаем директории для загрузок
     import os
     upload_dir = os.getenv("UPLOAD_DIR", "/app/uploads")
