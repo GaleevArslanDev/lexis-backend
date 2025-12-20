@@ -1,4 +1,5 @@
 from sqlmodel import SQLModel, create_engine, Session
+from sqlalchemy.pool import NullPool
 import os
 
 DATABASE_URL = os.environ["DATABASE_URL"]
