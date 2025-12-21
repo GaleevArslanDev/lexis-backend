@@ -2,17 +2,11 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Установка системных зависимостей для Tesseract и OpenCV
+# Установка только Tesseract
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     tesseract-ocr-rus \
     tesseract-ocr-eng \
-    libgl1 \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
-    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Копирование зависимостей
@@ -23,13 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Создание директорий для файлов
-RUN mkdir -p /app/uploads /app/processed
-
-# Установка Tesseract для русского языка (дополнительно)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    tesseract-ocr-rus \
-    tesseract-ocr-script-cyrl \
-    && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /app/uploads /app/uploads/processed
 
 EXPOSE 8000
 
