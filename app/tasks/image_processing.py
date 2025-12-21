@@ -4,6 +4,7 @@ import logging
 from typing import Dict, Any
 from sqlmodel import Session, select
 from app.db import engine
+import json
 from app.crud.assessment import (
     update_image_status,
     create_recognized_solution,
@@ -126,32 +127,36 @@ def process_assessment_image(self, image_id: int) -> Dict[str, Any]:
             )
 
             # 7. Создаем запись распознанного решения
-            recognized_solution = create_recognized_solution(
-                session,
-                image_id=image_id,
-                extracted_text=ocr_result.get("full_text", ""),
-                text_confidence=ocr_result.get("average_confidence", 0.0),
-                extracted_formulas_json=(
-                    json.dumps(ocr_result.get("formulas", []), ensure_ascii=False)
-                    if ocr_result.get("formulas") else None
-                ),
-                formulas_count=len(ocr_result.get("formulas", [])),
-                extracted_answer=structure_analysis.get('extracted_answer'),
-                answer_confidence=comparison_result.get('comparison_score', 0.0) if comparison_result else None,
-                solution_steps_json=(
-                    json.dumps(structure_analysis.get('steps', []), ensure_ascii=False)
-                    if structure_analysis.get('steps') else None
-                ),
-                ocr_confidence=confidence_data['component_scores'].get('ocr_confidence'),
-                solution_structure_confidence=confidence_data['component_scores'].get('solution_structure_confidence'),
-                formula_confidence=confidence_data['component_scores'].get('formula_confidence'),
-                answer_match_confidence=confidence_data['component_scores'].get('answer_match_confidence'),
-                total_confidence=confidence_data['total_confidence'],
-                check_level=confidence_data['check_level'],
-                suggested_grade=confidence_data['suggested_grade'],
-                auto_feedback=confidence_data['auto_feedback'],
-                processing_time_ms=int((time.time() - start_time) * 1000)
-            )
+            solution_data = {
+                "image_id": image_id,
+                "extracted_text": ocr_result.get("full_text", ""),
+                "text_confidence": ocr_result.get("average_confidence", 0.0),
+                "formulas_count": len(ocr_result.get("formulas", [])),
+                "extracted_answer": structure_analysis.get('extracted_answer'),
+                "answer_confidence": comparison_result.get('comparison_score', 0.0) if comparison_result else None,
+                "ocr_confidence": confidence_data['component_scores'].get('ocr_confidence'),
+                "solution_structure_confidence": confidence_data['component_scores'].get(
+                    'solution_structure_confidence'),
+                "formula_confidence": confidence_data['component_scores'].get('formula_confidence'),
+                "answer_match_confidence": confidence_data['component_scores'].get('answer_match_confidence'),
+                "total_confidence": confidence_data['total_confidence'],
+                "check_level": confidence_data['check_level'],
+                "suggested_grade": confidence_data['suggested_grade'],
+                "auto_feedback": confidence_data['auto_feedback'],
+                "processing_time_ms": int((time.time() - start_time) * 1000)
+            }
+
+            # Добавляем формулы если есть
+            if ocr_result.get("formulas"):
+                solution_data["extracted_formulas_json"] = json.dumps(ocr_result.get("formulas", []),
+                                                                      ensure_ascii=False)
+
+            # Добавляем шаги решения если есть
+            if structure_analysis.get('steps'):
+                solution_data["solution_steps_json"] = json.dumps(structure_analysis.get('steps', []),
+                                                                  ensure_ascii=False)
+
+            recognized_solution = create_recognized_solution(session, **solution_data)
 
             # 8. Обновляем статус изображения
             update_image_status(session, image_id, "processed")

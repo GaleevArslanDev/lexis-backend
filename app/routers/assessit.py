@@ -19,7 +19,7 @@ from ..crud.assessment import (
     create_assessment_result,
     get_class_assessments,
     get_class_assessment_summary,
-    get_teacher_dashboard_stats
+    get_teacher_dashboard_stats, get_assessment_result
 )
 from ..tasks.image_processing import process_assessment_image, batch_process_images
 from ..schemas import (
@@ -88,6 +88,9 @@ async def upload_student_work(
     # Если class_id не указан, берем из задания
     if not class_id:
         class_id = assignment.class_id
+
+    if class_id and assignment.class_id != class_id:
+        raise HTTPException(status_code=400, detail="Assignment doesn't belong to this class")
 
     # Проверяем, состоит ли студент в классе
     from ..models import ClassStudentLink

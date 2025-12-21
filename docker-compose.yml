@@ -1,60 +1,59 @@
-version: "3.8"
+version: '3.8'
 
 services:
-  backend:
-    build: .
-    container_name: lexis-backend
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-    volumes:
-      - .:/app
-      - uploads_volume:/app/uploads
-      - processed_volume:/app/processed
-    ports:
-      - "8000:8000"
-    env_file:
-      - .env
-    depends_on:
-      - db
-      - redis  # Добавляем Redis для Celery
-
-  db:
+  postgres:
     image: postgres:15
-    container_name: lexis-db
-    restart: unless-stopped
     environment:
-      POSTGRES_USER: lexis_user
-      POSTGRES_PASSWORD: lexis_pass
+      POSTGRES_USER: lexis
+      POSTGRES_PASSWORD: lexis_password
       POSTGRES_DB: lexis_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
 
   redis:
     image: redis:7-alpine
-    container_name: lexis-redis
     ports:
       - "6379:6379"
-    volumes:
-      - redis_data:/data
 
-  celery-worker:
+  backend:
     build: .
-    container_name: lexis-celery-worker
-    command: celery -A app.tasks.celery_app worker --loglevel=info
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://lexis:lexis_password@postgres/lexis_db
+      - REDIS_URL=redis://redis:6379/0
     volumes:
-      - .:/app
-      - uploads_volume:/app/uploads
-      - processed_volume:/app/processed
-    env_file:
-      - .env
+      - ./uploads:/app/uploads
+      - ./processed:/app/processed
     depends_on:
-      - db
+      - postgres
       - redis
-      - backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  celery_worker:
+    build: .
+    environment:
+      - DATABASE_URL=postgresql://lexis:lexis_password@postgres/lexis_db
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./uploads:/app/uploads
+      - ./processed:/app/processed
+    depends_on:
+      - postgres
+      - redis
+    command: celery -A app.tasks.celery_app worker --loglevel=info --queues=image_processing,batch_processing
+
+  celery_beat:
+    build: .
+    environment:
+      - DATABASE_URL=postgresql://lexis:lexis_password@postgres/lexis_db
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - postgres
+      - redis
+    command: celery -A app.tasks.celery_app beat --loglevel=info
 
 volumes:
-  pgdata:
-  redis_data:
-  uploads_volume:
-  processed_volume:
+  postgres_data:
