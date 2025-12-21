@@ -7,7 +7,11 @@ RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     tesseract-ocr-rus \
     tesseract-ocr-eng \
-    libgl1-mesa-glx \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -20,6 +24,12 @@ COPY . .
 
 # Создание директорий для файлов
 RUN mkdir -p /app/uploads /app/processed
+
+# Установка Tesseract для русского языка (дополнительно)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr-rus \
+    tesseract-ocr-script-cyrl \
+    && rm -rf /var/lib/apt/lists/*
 
 EXPOSE 8000
 
