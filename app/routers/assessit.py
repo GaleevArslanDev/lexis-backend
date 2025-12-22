@@ -236,6 +236,7 @@ def process_image_sync(image_id: int, session: Session) -> dict:
 async def upload_student_work(
         assignment_id: int,
         class_id: Optional[int] = None,
+        student_id: Optional[int] = None,
         question_id: Optional[int] = None,
         file: UploadFile = File(...),
         session: Session = Depends(get_session),
@@ -273,11 +274,14 @@ async def upload_student_work(
     if not class_id:
         class_id = assignment.class_id
 
+    if student_id is None:
+        student_id = current_user.id
+
     # Проверяем, состоит ли студент в классе
     link = session.exec(
         select(ClassStudentLink).where(
             ClassStudentLink.class_id == class_id,
-            ClassStudentLink.student_id == current_user.id
+            ClassStudentLink.student_id == student_id
         )
     ).first()
 
