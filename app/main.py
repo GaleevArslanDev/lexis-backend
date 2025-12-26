@@ -32,16 +32,8 @@ app.include_router(assessit.router)  # Новый роутер для AssessIt
 
 @app.on_event("startup")
 def on_startup():
-    # Создаем директории для загрузок
-    import os
-    upload_dir = os.getenv("UPLOAD_DIR", "/app/uploads")
-    processed_dir = os.getenv("PROCESSED_DIR", "/app/processed")
-
-    os.makedirs(upload_dir, exist_ok=True)
-    os.makedirs(processed_dir, exist_ok=True)
-
-    print(f"Upload directory: {upload_dir}")
-    print(f"Processed directory: {processed_dir}")
+    print("Lexis backend started with AssessIt system")
+    print("Files are processed in memory without saving to disk")
 
 
 @app.get("/")

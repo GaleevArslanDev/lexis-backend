@@ -161,7 +161,7 @@ class AssessmentImage(SQLModel, table=True):
     question_id: Optional[int] = Field(foreign_key="question.id", default=None)
 
     # Пути к файлам
-    original_image_path: str  # Относительный путь в контейнере
+    original_image_path: Optional[str] = None
     processed_image_path: Optional[str] = None
     thumbnail_path: Optional[str] = None
 

@@ -17,18 +17,7 @@ def create_assessment_image(
         class_id: Optional[int] = None,
         question_id: Optional[int] = None
 ) -> AssessmentImage:
-    """Создать запись о загруженной работе"""
-
-    # Генерируем путь для сохранения
-    import os
-    from uuid import uuid4
-
-    upload_dir = os.getenv("UPLOAD_DIR", "/app/uploads")
-    unique_id = uuid4().hex[:8]
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_filename = f"{student_id}_{assignment_id}_{timestamp}_{unique_id}_{file_name}"
-
-    image_path = os.path.join(upload_dir, safe_filename)
+    """Создать запись о загруженной работе (без сохранения файла)"""
 
     # Если есть class_id, получаем его из assignment
     if not class_id:
@@ -36,12 +25,13 @@ def create_assessment_image(
         if assignment:
             class_id = assignment.class_id
 
+    # Создаем запись без пути к файлу
     image = AssessmentImage(
         assignment_id=assignment_id,
         class_id=class_id,
         student_id=student_id,
         question_id=question_id,
-        original_image_path=image_path,
+        original_image_path="",  # Пусто, так как файл не сохраняем
         file_name=file_name,
         file_size=file_size,
         mime_type=mime_type,

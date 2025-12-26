@@ -1,15 +1,16 @@
 import json
 import time
-
+import io
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from sqlmodel import Session, select
 from typing import List, Optional
 import os
 import uuid
-import aiofiles
 from datetime import datetime
 import logging
+import cv2
+import numpy as np
 
 from ..db import get_session
 from ..dependencies.auth import get_current_user
@@ -25,9 +26,7 @@ from ..crud.assessment import (
     get_teacher_dashboard_stats, get_assessment_result, update_image_status, create_recognized_solution
 )
 from ..processing import OCREngine, ImagePreprocessor, SolutionAnalyzer, ConfidenceScorer, SymPyEvaluator
-from ..tasks.image_processing import process_assessment_image, batch_process_images
 from ..schemas import (
-    UploadWorkRequest,
     UploadWorkResponse,
     ProcessedWorkResponse,
     DetailedAnalysisResponse,
@@ -35,7 +34,6 @@ from ..schemas import (
     TeacherVerificationResponse,
     ClassAssessmentSummary,
     StudentWorkItem,
-    BatchUploadRequest,
     BatchUploadResponse,
     DashboardStats,
     CommonError
@@ -45,21 +43,60 @@ router = APIRouter(prefix="/assessit", tags=["assessit"])
 
 logger = logging.getLogger(__name__)
 
-# Конфигурация
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/app/uploads")
-MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_MB", "10")) * 1024 * 1024
-ALLOWED_EXTENSIONS = set(os.getenv("ALLOWED_EXTENSIONS", "jpg,jpeg,png,pdf").split(','))
-
 # Инициализация обработчиков
-image_preprocessor = ImagePreprocessor()
 ocr_engine = OCREngine(language=os.getenv("OCR_LANGUAGE", "rus+eng"))
 solution_analyzer = SolutionAnalyzer()
 confidence_scorer = ConfidenceScorer()
 sympy_evaluator = SymPyEvaluator()
 
+def bytes_to_cv2_image(file_bytes: bytes) -> np.ndarray:
+    """Конвертировать байты в изображение OpenCV"""
+    try:
+        nparr = np.frombuffer(file_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            # Попробуем как grayscale
+            img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+        return img
+    except Exception as e:
+        logger.error(f"Error converting bytes to image: {str(e)}")
+        raise
 
-def process_image_sync(image_id: int, session: Session) -> dict:
-    """Синхронная обработка изображения"""
+
+def process_image_from_bytes(image_bytes: bytes) -> dict:
+    """Обработать изображение из байтов"""
+    try:
+        # Конвертируем байты в изображение OpenCV
+        image_cv2 = bytes_to_cv2_image(image_bytes)
+        if image_cv2 is None:
+            return {"success": False, "error": "Failed to decode image"}
+
+        # Сохраняем временный файл в памяти (для OCR)
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+            temp_path = tmp.name
+            cv2.imwrite(temp_path, image_cv2)
+
+        try:
+            # OCR распознавание
+            ocr_result = ocr_engine.process_complete_page(
+                temp_path,
+                extract_formulas=True,
+                extract_answers=True
+            )
+        finally:
+            # Удаляем временный файл
+            os.unlink(temp_path)
+
+        return {"success": True, "ocr_result": ocr_result, "image_shape": image_cv2.shape}
+
+    except Exception as e:
+        logger.error(f"Error processing image from bytes: {str(e)}")
+        return {"success": False, "error": str(e)}
+
+
+def process_image_sync(image_id: int, file_bytes: bytes, session: Session) -> dict:
+    """Синхронная обработка изображения из байтов"""
     try:
         start_time = time.time()
 
@@ -70,39 +107,27 @@ def process_image_sync(image_id: int, session: Session) -> dict:
 
         logger.info(f"Starting processing for image {image_id}")
 
-        # 1. Обработка изображения (пропускаем для MVP или используем упрощенную версию)
-        processed_dir = os.getenv("PROCESSED_DIR", "/app/uploads/processed")
-        os.makedirs(processed_dir, exist_ok=True)
+        # Обработка изображения из байтов
+        processing_result = process_image_from_bytes(file_bytes)
 
-        # Для MVP просто копируем файл
-        base_name = os.path.basename(image.original_image_path)
-        processed_path = os.path.join(processed_dir, f"processed_{base_name}")
+        if not processing_result.get("success"):
+            error_msg = f"Image processing error: {processing_result.get('error')}"
+            update_image_status(session, image_id, "error", error_msg)
+            return {"success": False, "error": error_msg}
 
-        # Копируем файл
-        import shutil
-        shutil.copy2(image.original_image_path, processed_path)
-
-        image.processed_image_path = processed_path
-        session.commit()
-
-        # 2. OCR распознавание
-        ocr_result = ocr_engine.process_complete_page(
-            image.original_image_path,
-            extract_formulas=True,
-            extract_answers=True
-        )
+        ocr_result = processing_result.get("ocr_result", {})
 
         if "error" in ocr_result:
             error_msg = f"OCR error: {ocr_result['error']}"
             update_image_status(session, image_id, "error", error_msg)
             return {"success": False, "error": error_msg}
 
-        # 3. Анализ решения
+        # Анализ решения
         structure_analysis = solution_analyzer.analyze_solution_structure(
             ocr_result.get("full_text", "")
         )
 
-        # 4. Получаем данные задания для сравнения
+        # Получаем данные задания для сравнения
         from ..models import Question
         assignment = session.get(Assignment, image.assignment_id)
         reference_data = {}
@@ -120,14 +145,14 @@ def process_image_sync(image_id: int, session: Session) -> dict:
                 if not reference_data.get("reference_answer"):
                     reference_data["reference_answer"] = question.correct_answer
 
-        # 5. Сравнение с эталоном
+        # Сравнение с эталоном
         comparison_result = solution_analyzer.compare_with_reference(
             ocr_result.get("full_text", ""),
             reference_data.get("reference_solution"),
             reference_data.get("reference_answer")
         )
 
-        # 6. Расчет confidence scores (упрощенный для MVP)
+        # Расчет confidence scores
         full_text = ocr_result.get("full_text", "")
         avg_confidence = ocr_result.get('average_confidence', 50.0)
 
@@ -164,7 +189,7 @@ def process_image_sync(image_id: int, session: Session) -> dict:
         elif answer_match > 0.3:
             suggested_grade = total_confidence * 100 * 0.7
 
-        # 7. Создаем запись распознанного решения
+        # Создаем запись распознанного решения
         solution_data = {
             "image_id": image_id,
             "extracted_text": ocr_result.get("full_text", ""),
@@ -199,7 +224,7 @@ def process_image_sync(image_id: int, session: Session) -> dict:
 
         recognized_solution = create_recognized_solution(session, **solution_data)
 
-        # 8. Обновляем статус изображения
+        # Обновляем статус изображения
         update_image_status(session, image_id, "processed")
 
         processing_time = int((time.time() - start_time) * 1000)
@@ -231,8 +256,7 @@ def process_image_sync(image_id: int, session: Session) -> dict:
             "image_id": image_id
         }
 
-
-@router.post("/upload-work", response_model=UploadWorkResponse)
+@router.post("/upload-work")
 async def upload_student_work(
         assignment_id: int,
         class_id: Optional[int] = None,
@@ -243,27 +267,13 @@ async def upload_student_work(
         current_user: User = Depends(get_current_user)
 ):
     """Загрузить работу студента"""
-
     # Проверяем файл
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided")
 
-    file_ext = file.filename.split('.')[-1].lower()
-    if file_ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"File type not allowed. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
-        )
-
-    # Проверяем размер файла
+    # Читаем содержимое файла
     file_content = await file.read()
     file_size = len(file_content)
-
-    if file_size > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=400,
-            detail=f"File too large. Max size: {MAX_FILE_SIZE // (1024 * 1024)}MB"
-        )
 
     # Проверяем существование задания
     assignment = session.get(Assignment, assignment_id)
@@ -289,20 +299,7 @@ async def upload_student_work(
         raise HTTPException(status_code=403, detail="Student not in this class")
 
     try:
-        # Сохраняем файл
-        unique_id = uuid.uuid4().hex[:8]
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_filename = f"{current_user.id}_{assignment_id}_{timestamp}_{unique_id}_{file.filename}"
-        file_path = os.path.join(UPLOAD_DIR, safe_filename)
-
-        # Создаем директорию если нет
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
-
-        # Сохраняем файл
-        async with aiofiles.open(file_path, 'wb') as out_file:
-            await out_file.write(file_content)
-
-        # Создаем запись в БД
+        # Создаем запись в БД (без сохранения файла на диск)
         image = create_assessment_image(
             session=session,
             assignment_id=assignment_id,
@@ -314,8 +311,8 @@ async def upload_student_work(
             question_id=question_id
         )
 
-        # СИНХРОННАЯ обработка
-        process_result = process_image_sync(image.id, session)
+        # СИНХРОННАЯ обработка из байтов
+        process_result = process_image_sync(image.id, file_content, session)
 
         if not process_result.get("success"):
             logger.error(f"Processing failed for image {image.id}: {process_result.get('error')}")
@@ -329,7 +326,6 @@ async def upload_student_work(
         logger.error(f"Error uploading work: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
-
 @router.get("/work-status/{work_id}", response_model=ProcessedWorkResponse)
 async def get_work_status(
         work_id: int,
@@ -337,7 +333,6 @@ async def get_work_status(
         current_user: User = Depends(get_current_user)
 ):
     """Получить статус обработки работы"""
-
     image = get_assessment_image(session, work_id)
     if not image:
         raise HTTPException(status_code=404, detail="Work not found")
@@ -623,13 +618,11 @@ async def batch_upload_works(
         current_user: User = Depends(require_role("teacher"))
 ):
     """Пакетная загрузка работ (синхронная обработка)"""
-
     successful_uploads = []
     failed_uploads = []
 
     for file in files:
         try:
-            # Для каждой работы находим student_id из имени файла
             filename = file.filename
             student_id = None
 
@@ -666,20 +659,7 @@ async def batch_upload_works(
             file_content = await file.read()
             file_size = len(file_content)
 
-            # Сохраняем файл
-            unique_id = uuid.uuid4().hex[:8]
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            safe_filename = f"{student_id}_{assignment_id}_{timestamp}_{unique_id}_{filename}"
-            file_path = os.path.join(UPLOAD_DIR, safe_filename)
-
-            # Создаем директорию если нет
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-
-            # Сохраняем файл
-            async with aiofiles.open(file_path, 'wb') as out_file:
-                await out_file.write(file_content)
-
-            # Создаем запись в БД
+            # Создаем запись в БД (без сохранения файла на диск)
             image = create_assessment_image(
                 session=session,
                 assignment_id=assignment_id,
@@ -690,8 +670,8 @@ async def batch_upload_works(
                 class_id=class_id
             )
 
-            # СИНХРОННАЯ обработка
-            process_result = process_image_sync(image.id, session)
+            # СИНХРОННАЯ обработка из байтов
+            process_result = process_image_sync(image.id, file_content, session)
 
             if process_result.get("success"):
                 successful_uploads.append(image.id)

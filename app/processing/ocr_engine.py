@@ -23,6 +23,68 @@ class OCREngine:
             'formula': r'--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789+-=*/()[]{}<>\|',  # Для формул
         }
 
+    def process_from_bytes(self, image_bytes: bytes) -> Dict:
+        """Обработать изображение из байтов"""
+        try:
+            # Конвертируем байты в изображение OpenCV
+            import cv2
+            import numpy as np
+
+            nparr = np.frombuffer(image_bytes, np.uint8)
+            image = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+
+            if image is None:
+                return {"error": "Failed to decode image"}
+
+            # Основной текст
+            full_text, avg_confidence, detailed_info = self.extract_text_with_confidence(image)
+
+            result = {
+                "full_text": full_text,
+                "average_confidence": avg_confidence,
+                "character_count": len(full_text),
+                "word_count": len(full_text.split()),
+                "detailed_info": detailed_info
+            }
+
+            # Формулы
+            formulas = self.extract_formulas(image)
+            result["formulas"] = formulas
+            result["formula_count"] = len(formulas)
+
+            # Кандидаты на ответ
+            answer_candidates = self.extract_answer_candidates(image)
+            result["answer_candidates"] = answer_candidates
+
+            if answer_candidates:
+                primary_candidate = None
+                for candidate in answer_candidates:
+                    if "Ответ" in candidate['context']:
+                        primary_candidate = candidate
+                        break
+
+                if primary_candidate is None and answer_candidates:
+                    primary_candidate = answer_candidates[0]
+
+                result["primary_answer"] = primary_candidate
+
+            # Разбивка на строки
+            lines = full_text.split('\n')
+            result["lines"] = [
+                {"text": line.strip(), "line_number": i}
+                for i, line in enumerate(lines) if line.strip()
+            ]
+
+            # Оценка качества распознавания
+            quality_score = self.assess_ocr_quality(full_text, avg_confidence)
+            result["quality_assessment"] = quality_score
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Error processing image from bytes: {str(e)}")
+            return {"error": str(e)}
+
     def image_to_pil(self, cv_image: np.ndarray) -> Image.Image:
         """Конвертировать OpenCV image в PIL Image"""
         if len(cv_image.shape) == 2:
