@@ -1,4 +1,6 @@
 import json
+import resource
+import sys
 import time
 import io
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks
@@ -38,6 +40,11 @@ from ..schemas import (
     DashboardStats,
     CommonError
 )
+
+try:
+    resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 * 1024, 512 * 1024 * 1024))
+except:
+    pass
 
 router = APIRouter(prefix="/assessit", tags=["assessit"])
 

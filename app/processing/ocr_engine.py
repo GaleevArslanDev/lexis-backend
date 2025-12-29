@@ -1,59 +1,46 @@
+# app/processing/ocr_engine.py - ЛЕГКОВЕСНЫЙ ВАРИАНТ
 import cv2
 import numpy as np
 import json
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 import logging
 import re
 from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
-# Глобальная переменная для хранения reader (singleton)
-_READER = None
+# Глобальная переменная для pipeline
+_PIPELINE = None
 
 
-def get_easyocr_reader():
-    """Ленивая загрузка EasyOCR для экономии памяти"""
-    global _READER
+def get_keras_ocr_pipeline():
+    """Ленивая загрузка Keras-OCR pipeline"""
+    global _PIPELINE
 
-    if _READER is None:
+    if _PIPELINE is None:
         try:
-            # Импортируем только когда нужно
-            import easyocr
-            logger.info("Loading EasyOCR model (this may take a moment)...")
-            # Используем только русский язык для экономии памяти
-            _READER = easyocr.Reader(['ru'], gpu=False)
-            logger.info("EasyOCR model loaded successfully")
+            import keras_ocr
+            logger.info("Loading Keras-OCR pipeline (this may take a moment)...")
+            # Используем легковесный детектор и распознаватель
+            _PIPELINE = keras_ocr.pipeline.Pipeline()
+            logger.info("Keras-OCR pipeline loaded successfully")
         except ImportError as e:
-            logger.error(f"EasyOCR not installed: {e}")
-            _READER = None
+            logger.error(f"Keras-OCR not installed: {e}")
+            _PIPELINE = None
         except Exception as e:
-            logger.error(f"Failed to load EasyOCR: {e}")
-            _READER = None
+            logger.error(f"Failed to load Keras-OCR: {e}")
+            _PIPELINE = None
 
-    return _READER
+    return _PIPELINE
 
 
 class OCREngine:
     def __init__(self, language: str = "ru"):
         self.language = language
-        self.use_easyocr = True
-
-        # Проверяем, можем ли мы использовать EasyOCR
-        try:
-            reader = get_easyocr_reader()
-            if reader is None:
-                self.use_easyocr = False
-                logger.warning("Falling back to basic image processing")
-        except:
-            self.use_easyocr = False
-
-        # Конфигурация для Tesseract (fallback)
-        self.tesseract_path = os.getenv("TESSERACT_PATH", "/usr/bin/tesseract")
 
     def process_from_bytes(self, image_bytes: bytes) -> Dict:
-        """Обработать изображение с оптимальным использованием памяти"""
+        """Обработка изображения с Keras-OCR"""
         try:
             # Конвертируем байты в изображение
             nparr = np.frombuffer(image_bytes, np.uint8)
@@ -61,183 +48,89 @@ class OCREngine:
             if image is None:
                 return {"error": "Failed to decode image"}
 
-            # Предобработка изображения
-            processed = self.preprocess_image(image)
+            # Предобработка для рукописного текста
+            processed = self.preprocess_for_handwriting(image)
 
-            # Пробуем EasyOCR если доступен
-            if self.use_easyocr:
-                try:
-                    result = self._process_with_easyocr(processed)
-                    if result.get("success", False):
-                        return result
-                except Exception as e:
-                    logger.warning(f"EasyOCR failed, falling back: {str(e)}")
-                    self.use_easyocr = False
+            # Получаем pipeline
+            pipeline = get_keras_ocr_pipeline()
+            if pipeline is None:
+                return self._process_fallback(processed)
 
-            # Fallback: улучшенная обработка изображения + базовая логика
-            return self._process_fallback(processed)
+            # Выполняем OCR
+            predictions = pipeline.recognize([processed])
+
+            # Извлекаем текст и уверенность
+            if predictions and len(predictions[0]) > 0:
+                texts = []
+                confidences = []
+
+                for text, box in predictions[0]:
+                    texts.append(text)
+                    # Keras-OCR не возвращает уверенность напрямую, используем эвристику
+                    confidences.append(0.8)  # Примерная уверенность
+
+                full_text = " ".join(texts)
+                avg_confidence = sum(confidences) / len(confidences) * 100 if confidences else 50
+            else:
+                full_text = ""
+                avg_confidence = 0
+
+            return {
+                "success": True,
+                "full_text": full_text,
+                "average_confidence": avg_confidence,
+                "character_count": len(full_text),
+                "word_count": len(full_text.split()),
+                "formulas": self.extract_formulas(full_text),
+                "answer_candidates": self.extract_answers(full_text)
+            }
 
         except Exception as e:
             logger.error(f"Error processing image: {str(e)}")
             return {"error": str(e), "success": False}
 
-    def _process_with_easyocr(self, image: np.ndarray) -> Dict:
-        """Обработка с использованием EasyOCR"""
-        reader = get_easyocr_reader()
-        if reader is None:
-            return {"success": False, "error": "EasyOCR not available"}
-
+    def preprocess_for_handwriting(self, image: np.ndarray) -> np.ndarray:
+        """Оптимизированная предобработка для рукописного текста"""
         try:
-            # Используем низкие настройки для экономии памяти
-            result = reader.readtext(image, paragraph=True, detail=0)
-
-            if result:
-                full_text = " ".join(result)
+            # Конвертируем в grayscale
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             else:
-                full_text = ""
+                gray = image.copy()
 
-            return {
-                "success": True,
-                "full_text": full_text,
-                "average_confidence": 80.0,  # Примерная уверенность
-                "character_count": len(full_text),
-                "word_count": len(full_text.split()),
-                "formulas": self.extract_formulas_from_text(full_text),
-                "answer_candidates": self.extract_answer_candidates(full_text)
-            }
+            # Улучшение контраста (упрощенное)
+            # Используем гистограммное выравнивание
+            equalized = cv2.equalizeHist(gray)
 
-        except Exception as e:
-            logger.error(f"EasyOCR processing error: {str(e)}")
-            return {"success": False, "error": str(e)}
+            # Легкое размытие для удаления шума
+            blurred = cv2.GaussianBlur(equalized, (3, 3), 0)
 
-    def _process_fallback(self, image: np.ndarray) -> Dict:
-        """Fallback обработка без тяжелых моделей"""
-        try:
-            # Улучшенная предобработка для рукописного текста
-            enhanced = self.enhance_handwritten_text(image)
+            # Пороговая обработка
+            _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-            # Простая сегментация текста
-            text_blocks = self.extract_text_blocks(enhanced)
+            # Инвертируем если нужно (черный текст на белом фоне)
+            if np.mean(binary) > 127:
+                binary = cv2.bitwise_not(binary)
 
-            # Собираем текст из блоков
-            all_text = []
-            for block in text_blocks:
-                # Простая логика для извлечения текста
-                # Можно добавить contour analysis для лучших результатов
-                text = self.extract_text_from_block(block)
-                if text:
-                    all_text.append(text)
+            # Конвертируем обратно в RGB для Keras-OCR
+            rgb = cv2.cvtColor(binary, cv2.COLOR_GRAY2RGB)
 
-            full_text = " ".join(all_text)
-
-            # Базовая очистка текста
-            full_text = self.clean_text(full_text)
-
-            return {
-                "success": True,
-                "full_text": full_text,
-                "average_confidence": 60.0,  # Средняя уверенность для fallback
-                "character_count": len(full_text),
-                "word_count": len(full_text.split()),
-                "formulas": self.extract_formulas_from_text(full_text),
-                "answer_candidates": self.extract_answer_candidates(full_text)
-            }
+            return rgb
 
         except Exception as e:
-            logger.error(f"Fallback processing error: {str(e)}")
-            return {"success": False, "error": str(e), "full_text": ""}
-
-    def preprocess_image(self, image: np.ndarray) -> np.ndarray:
-        """Базовая предобработка"""
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image.copy()
-
-        # Улучшение контраста
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
-
-        return enhanced
-
-    def enhance_handwritten_text(self, image: np.ndarray) -> np.ndarray:
-        """Улучшение рукописного текста"""
-        try:
-            # Бинаризация с адаптивным порогом
-            binary = cv2.adaptiveThreshold(
-                image, 255,
-                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY_INV, 11, 2
-            )
-
-            # Удаление мелкого шума
-            kernel = np.ones((1, 1), np.uint8)
-            cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-
-            # Увеличение толщины текста
-            kernel = np.ones((2, 2), np.uint8)
-            dilated = cv2.dilate(cleaned, kernel, iterations=1)
-
-            return dilated
-
-        except Exception as e:
-            logger.error(f"Error enhancing handwritten text: {str(e)}")
+            logger.error(f"Error in preprocessing: {str(e)}")
             return image
 
-    def extract_text_blocks(self, image: np.ndarray) -> List[np.ndarray]:
-        """Извлечение текстовых блоков"""
-        try:
-            # Находим контуры
-            contours, _ = cv2.findContours(
-                image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
-
-            blocks = []
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if area > 100:  # Фильтруем мелкие контуры
-                    x, y, w, h = cv2.boundingRect(contour)
-                    block = image[y:y + h, x:x + w]
-                    blocks.append(block)
-
-            # Сортируем сверху вниз
-            blocks.sort(key=lambda b: b.shape[0])
-
-            return blocks
-
-        except Exception as e:
-            logger.error(f"Error extracting text blocks: {str(e)}")
-            return []
-
-    def extract_text_from_block(self, block: np.ndarray) -> str:
-        """Извлечение текста из блока (упрощенное)"""
-        # Здесь можно добавить простую логику распознавания
-        # Например, по соотношению черных/белых пикселей и структуре
-
-        # Пока возвращаем пустую строку
-        # В реальной реализации можно добавить простой OCR на основе шаблонов
-        return ""
-
-    def clean_text(self, text: str) -> str:
-        """Очистка текста"""
-        if not text:
-            return ""
-
-        # Удаляем лишние символы
-        text = re.sub(r'[^\w\s\.\,\-\+\=\*\/\(\)\d]', '', text)
-        text = re.sub(r'\s+', ' ', text)
-
-        return text.strip()
-
-    def extract_formulas_from_text(self, text: str) -> List[Dict]:
+    def extract_formulas(self, text: str) -> List[Dict]:
         """Извлечение формул из текста"""
         formulas = []
 
-        # Простые паттерны для формул
+        # Простые паттерны для математических выражений
         patterns = [
-            r'[a-zA-Z]\s*=\s*[^=]+',
-            r'\d+\s*[+\-*/]\s*\d+',
-            r'\d+\s*=\s*\d+',
+            r'[a-zA-Z]\s*=\s*[^=]+',  # x = выражение
+            r'\d+\s*[+\-*/]\s*\d+',  # 5 + 3, 4*2
+            r'[0-9]+\s*=\s*[0-9]+',  # 150 = 150
+            r'[a-zA-Z]:?\s*\d+',  # x: 91, k=12
         ]
 
         for pattern in patterns:
@@ -246,20 +139,20 @@ class OCREngine:
                 formula_text = match.group(0).strip()
                 formulas.append({
                     'latex': formula_text,
-                    'confidence': 0.6,
+                    'confidence': 0.7,
                     'original_text': formula_text
                 })
 
         return formulas
 
-    def extract_answer_candidates(self, text: str) -> List[Dict]:
-        """Извлечение кандидатов на ответ"""
+    def extract_answers(self, text: str) -> List[Dict]:
+        """Извлечение ответов из текста"""
         candidates = []
 
         patterns = [
-            r'Ответ\s*[:=]\s*([^\n]+)',
-            r'[Aa]nswer\s*[:=]\s*([^\n]+)',
-            r'=\s*([0-9.,]+)',
+            r'Ответ\s*[:=]\s*([0-9.,]+)',
+            r'[Aa]nswer\s*[:=]\s*([0-9.,]+)',
+            r'=\s*([0-9.,]+)\s*$',
             r'получим\s*([0-9.,]+)',
             r'равно\s*([0-9.,]+)',
         ]
@@ -272,52 +165,51 @@ class OCREngine:
                     candidates.append({
                         'text': answer_text,
                         'pattern': pattern,
-                        'position': (match.start(1), match.end(1)),
-                        'context': text[max(0, match.start() - 20):match.end() + 20]
+                        'context': match.group(0)
                     })
 
         return candidates
 
-    def assess_ocr_quality(self, text: str, avg_confidence: float) -> Dict:
-        """Оценка качества"""
-        length = len(text)
-        words = len(text.split())
-
-        if length < 10:
-            length_score = 0.1
-        elif length < 50:
-            length_score = 0.3
-        elif length < 200:
-            length_score = 0.7
-        else:
-            length_score = 1.0
-
-        math_symbols = set('+-*/=<>()')
-        math_count = sum(1 for c in text if c in math_symbols)
-        math_score = min(math_count / 5.0, 1.0)
-
-        conf_norm = avg_confidence / 100.0
-        overall = conf_norm * 0.5 + length_score * 0.3 + math_score * 0.2
-
-        return {
-            "score": round(overall, 2),
-            "avg_confidence": round(avg_confidence, 2),
-            "interpretation": self._quality_label(overall)
-        }
-
-    def _quality_label(self, score: float) -> str:
-        if score >= 0.7:
-            return "good"
-        elif score >= 0.4:
-            return "fair"
-        else:
-            return "poor"
-
-    def process_complete_page(self, image_path: str, **kwargs) -> Dict:
-        """Обработка полной страницы"""
+    def _process_fallback(self, image: np.ndarray) -> Dict:
+        """Fallback обработка - ищем цифры и буквы"""
         try:
-            with open(image_path, 'rb') as f:
-                image_bytes = f.read()
-            return self.process_from_bytes(image_bytes)
+            # Конвертируем в grayscale
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = image.copy()
+
+            # Простая бинаризация
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+            # Инвертируем если нужно
+            if np.mean(binary) > 127:
+                binary = cv2.bitwise_not(binary)
+
+            # Ищем контуры символов
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            # Простая логика: считаем что каждый контур - это символ
+            char_count = len(contours)
+
+            # Очень упрощенная логика - если есть контуры, предполагаем текст
+            if char_count > 10:
+                text = f"[Работа содержит ~{char_count} символов]"
+                confidence = 50
+            else:
+                text = ""
+                confidence = 0
+
+            return {
+                "success": True,
+                "full_text": text,
+                "average_confidence": confidence,
+                "character_count": len(text),
+                "word_count": len(text.split()),
+                "formulas": [],
+                "answer_candidates": []
+            }
+
         except Exception as e:
-            return {"error": str(e), "success": False}
+            logger.error(f"Fallback error: {str(e)}")
+            return {"success": False, "error": str(e)}
