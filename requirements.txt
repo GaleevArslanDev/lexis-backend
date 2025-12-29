@@ -33,4 +33,4 @@ redis==5.0.1
 
 # OCR (ЛЕГКИЙ ВАРИАНТ)
 keras-ocr==0.9.3
-tensorflow==2.13.0
+tensorflow
