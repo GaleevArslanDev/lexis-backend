@@ -174,6 +174,103 @@ class OCREngine:
             "details": details
         }
 
+    def process_handwritten_text(self, image: np.ndarray) -> Dict:
+        """Специализированная обработка для рукописных текстов"""
+        try:
+            # Специальная предобработка для рукописного текста
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = image.copy()
+
+            # 1. Улучшение контраста
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(gray)
+
+            # 2. Удаление фона тетрадной сетки
+            _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+            # 3. Удаление мелкого шума (сетки)
+            kernel = np.ones((1, 1), np.uint8)
+            cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+
+            # 4. Увеличение толщины линий (для тонких рукописных текстов)
+            kernel = np.ones((2, 2), np.uint8)
+            dilated = cv2.dilate(cleaned, kernel, iterations=1)
+
+            # Сохраняем для отладки
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                temp_path = tmp.name
+                cv2.imwrite(temp_path, dilated)
+
+            try:
+                # Специальная конфигурация для рукописного математического текста
+                custom_config = r'--oem 3 --psm 6 -l rus+eng+equ'
+
+                # Распознавание с разными параметрами
+                pil_image = Image.fromarray(dilated)
+
+                # Основной текст
+                data = pytesseract.image_to_data(
+                    pil_image,
+                    lang='rus+eng',
+                    config=custom_config,
+                    output_type=pytesseract.Output.DICT
+                )
+
+                # Также пробуем получить сырой текст с другим psm
+                text_alt = pytesseract.image_to_string(
+                    pil_image,
+                    lang='rus+eng',
+                    config='--oem 3 --psm 11'
+                )
+
+                # Собираем текст
+                text_parts = []
+                avg_conf = 0
+                count = 0
+
+                for i in range(len(data['text'])):
+                    word = data['text'][i].strip()
+                    conf = float(data['conf'][i])
+
+                    if word and conf > 10:
+                        text_parts.append(word)
+                        avg_conf += conf
+                        count += 1
+
+                # Используем альтернативный метод если основной не дал результатов
+                if not text_parts and text_alt.strip():
+                    text = text_alt.strip()
+                    avg_conf = 50.0  # примерная уверенность
+                else:
+                    text = ' '.join(text_parts)
+                    avg_conf = avg_conf / max(count, 1)
+
+                # Ищем формулы
+                formulas = self.extract_formulas(dilated)
+
+                # Ищем ответы
+                answer_candidates = self.extract_answer_candidates_from_text(text)
+
+                return {
+                    "success": True,
+                    "full_text": text,
+                    "average_confidence": avg_conf,
+                    "formulas": formulas,
+                    "answer_candidates": answer_candidates,
+                    "character_count": len(text),
+                    "word_count": len(text.split())
+                }
+
+            finally:
+                os.unlink(temp_path)
+
+        except Exception as e:
+            logger.error(f"Error processing handwritten text: {str(e)}")
+            return {"success": False, "error": str(e)}
+
     def extract_formulas(self, image: np.ndarray) -> List[Dict]:
         """Выделить математические формулы"""
         try:

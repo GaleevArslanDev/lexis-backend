@@ -107,27 +107,50 @@ def process_image_sync(image_id: int, file_bytes: bytes, session: Session) -> di
 
         logger.info(f"Starting processing for image {image_id}")
 
-        # Обработка изображения из байтов
-        processing_result = process_image_from_bytes(file_bytes)
-
-        if not processing_result.get("success"):
-            error_msg = f"Image processing error: {processing_result.get('error')}"
+        # Конвертируем байты в изображение OpenCV
+        image_cv2 = bytes_to_cv2_image(file_bytes)
+        if image_cv2 is None:
+            error_msg = "Failed to convert bytes to image"
             update_image_status(session, image_id, "error", error_msg)
             return {"success": False, "error": error_msg}
 
-        ocr_result = processing_result.get("ocr_result", {})
+        # Сохраняем временный файл для отладки
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+            temp_path = tmp.name
+            cv2.imwrite(temp_path, image_cv2)
 
-        if "error" in ocr_result:
-            error_msg = f"OCR error: {ocr_result['error']}"
+        try:
+            # Используем специализированную обработку для рукописных текстов
+            ocr_result = ocr_engine.process_handwritten_text(image_cv2)
+
+            if not ocr_result.get("success"):
+                # Пробуем стандартный метод как fallback
+                ocr_result = ocr_engine.process_complete_page(
+                    temp_path,
+                    extract_formulas=True,
+                    extract_answers=True
+                )
+        finally:
+            os.unlink(temp_path)
+
+        if "error" in ocr_result or not ocr_result.get("success", True):
+            error_msg = f"OCR error: {ocr_result.get('error', 'Unknown error')}"
             update_image_status(session, image_id, "error", error_msg)
             return {"success": False, "error": error_msg}
+
+        # Получаем текст
+        full_text = ocr_result.get("full_text", "")
+        avg_confidence = ocr_result.get("average_confidence", 50.0)
+
+        # Логируем результат OCR для отладки
+        logger.info(f"OCR result for image {image_id}: {full_text[:100]}...")
+        logger.info(f"OCR confidence: {avg_confidence}")
 
         # Анализ решения
-        structure_analysis = solution_analyzer.analyze_solution_structure(
-            ocr_result.get("full_text", "")
-        )
+        structure_analysis = solution_analyzer.analyze_solution_structure(full_text)
 
-        # Получаем данные задания для сравнения
+        # Получаем данные задания
         from ..models import Question
         assignment = session.get(Assignment, image.assignment_id)
         reference_data = {}
@@ -136,7 +159,6 @@ def process_image_sync(image_id: int, file_bytes: bytes, session: Session) -> di
             reference_data["reference_solution"] = assignment.reference_solution
             reference_data["reference_answer"] = assignment.reference_answer
 
-        # Если есть конкретный вопрос
         if image.question_id:
             question = session.get(Question, image.question_id)
             if question:
@@ -147,33 +169,39 @@ def process_image_sync(image_id: int, file_bytes: bytes, session: Session) -> di
 
         # Сравнение с эталоном
         comparison_result = solution_analyzer.compare_with_reference(
-            ocr_result.get("full_text", ""),
+            full_text,
             reference_data.get("reference_solution"),
             reference_data.get("reference_answer")
         )
 
-        # Расчет confidence scores
-        full_text = ocr_result.get("full_text", "")
-        avg_confidence = ocr_result.get('average_confidence', 50.0)
+        # Улучшенный расчет confidence
+        text_length = len(full_text)
+        has_structure = structure_analysis.get('has_solution_section', False) or structure_analysis.get('has_answer',
+                                                                                                        False)
 
-        # Упрощенный расчет confidence для MVP
+        # Взвешенные факторы
+        ocr_factor = avg_confidence / 100.0
+        length_factor = min(text_length / 200.0, 1.0)  # нормализуем длину
+        structure_factor = 1.0 if has_structure else 0.3
+
         if comparison_result and comparison_result.get('success'):
-            answer_match = comparison_result.get('comparison_score', 0.0)
+            answer_factor = comparison_result.get('comparison_score', 0.5)
         else:
-            answer_match = 0.5 if full_text else 0.0
+            answer_factor = 0.5 if text_length > 10 else 0.1
 
-        # Базовая эвристика
-        text_length_score = min(len(full_text) / 500, 1.0)
-        has_answer = 1.0 if structure_analysis.get('extracted_answer') else 0.3
-        total_confidence = (avg_confidence / 100 * 0.4 +
-                            text_length_score * 0.3 +
-                            answer_match * 0.3)
+        # Комбинируем факторы с весами
+        total_confidence = (
+                ocr_factor * 0.4 +
+                length_factor * 0.2 +
+                structure_factor * 0.2 +
+                answer_factor * 0.2
+        )
 
         # Определяем уровень проверки
-        if total_confidence >= 0.85:
+        if total_confidence >= 0.7:
             check_level = "level_1"
             auto_feedback = "✅ Работа распознана хорошо, можно проверить автоматически."
-        elif total_confidence >= 0.6:
+        elif total_confidence >= 0.4:
             check_level = "level_2"
             auto_feedback = "⚠️ Требуется внимание учителя: некоторые элементы требуют проверки."
         else:
@@ -182,25 +210,25 @@ def process_image_sync(image_id: int, file_bytes: bytes, session: Session) -> di
 
         # Предлагаем оценку
         suggested_grade = None
-        if answer_match > 0.8:
-            suggested_grade = min(total_confidence * 100 * 1.1, 100)
-        elif answer_match > 0.5:
+        if answer_factor > 0.7:
+            suggested_grade = min(total_confidence * 100 * 1.2, 100)
+        elif answer_factor > 0.4:
             suggested_grade = total_confidence * 100
-        elif answer_match > 0.3:
-            suggested_grade = total_confidence * 100 * 0.7
+        elif answer_factor > 0.2:
+            suggested_grade = total_confidence * 100 * 0.8
 
         # Создаем запись распознанного решения
         solution_data = {
             "image_id": image_id,
-            "extracted_text": ocr_result.get("full_text", ""),
+            "extracted_text": full_text,
             "text_confidence": avg_confidence,
             "formulas_count": len(ocr_result.get("formulas", [])),
             "extracted_answer": structure_analysis.get('extracted_answer'),
             "answer_confidence": comparison_result.get('comparison_score', 0.0) if comparison_result else None,
-            "ocr_confidence": avg_confidence / 100,
-            "solution_structure_confidence": structure_analysis.get('completeness_score', 0.0),
+            "ocr_confidence": ocr_factor,
+            "solution_structure_confidence": structure_factor,
             "formula_confidence": 0.5 if ocr_result.get("formulas") else 0.1,
-            "answer_match_confidence": answer_match,
+            "answer_match_confidence": answer_factor,
             "total_confidence": total_confidence,
             "check_level": check_level,
             "suggested_grade": suggested_grade,
@@ -208,14 +236,12 @@ def process_image_sync(image_id: int, file_bytes: bytes, session: Session) -> di
             "processing_time_ms": int((time.time() - start_time) * 1000)
         }
 
-        # Добавляем формулы если есть
         if ocr_result.get("formulas"):
             solution_data["extracted_formulas_json"] = json.dumps(
                 ocr_result.get("formulas", []),
                 ensure_ascii=False
             )
 
-        # Добавляем шаги решения если есть
         if structure_analysis.get('steps'):
             solution_data["solution_steps_json"] = json.dumps(
                 structure_analysis.get('steps', []),
@@ -223,12 +249,9 @@ def process_image_sync(image_id: int, file_bytes: bytes, session: Session) -> di
             )
 
         recognized_solution = create_recognized_solution(session, **solution_data)
-
-        # Обновляем статус изображения
         update_image_status(session, image_id, "processed")
 
         processing_time = int((time.time() - start_time) * 1000)
-
         logger.info(f"Successfully processed image {image_id} in {processing_time}ms")
 
         return {
@@ -243,18 +266,11 @@ def process_image_sync(image_id: int, file_bytes: bytes, session: Session) -> di
 
     except Exception as e:
         logger.error(f"Error processing image {image_id}: {str(e)}", exc_info=True)
-
-        # Обновляем статус в случае ошибки
         try:
             update_image_status(session, image_id, "error", str(e))
         except:
             pass
-
-        return {
-            "success": False,
-            "error": str(e),
-            "image_id": image_id
-        }
+        return {"success": False, "error": str(e)}
 
 @router.post("/upload-work")
 async def upload_student_work(
@@ -437,6 +453,94 @@ async def get_work_details(
         processed_at=solution.recognized_at
     )
 
+
+@router.post("/debug-ocr")
+async def debug_ocr(
+        file: UploadFile = File(...),
+        session: Session = Depends(get_session),
+        current_user: User = Depends(require_role("teacher"))
+):
+    """Эндпоинт для отладки OCR"""
+
+    # Читаем файл
+    file_content = await file.read()
+
+    # Конвертируем в OpenCV
+    image_cv2 = bytes_to_cv2_image(file_content)
+    if image_cv2 is None:
+        raise HTTPException(status_code=400, detail="Failed to decode image")
+
+    # Сохраняем временно
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+        temp_path = tmp.name
+        cv2.imwrite(temp_path, image_cv2)
+
+    results = {}
+
+    try:
+        # Тестируем различные конфигурации
+        configs = [
+            ("psm6", "--oem 3 --psm 6"),
+            ("psm4", "--oem 3 --psm 4"),
+            ("psm11", "--oem 3 --psm 11"),
+            ("psm3", "--oem 3 --psm 3"),
+        ]
+
+        for config_name, config in configs:
+            try:
+                # Пробуем с русским языком
+                text_rus = pytesseract.image_to_string(
+                    Image.open(temp_path),
+                    lang='rus',
+                    config=config
+                )
+
+                # Пробуем с английским
+                text_eng = pytesseract.image_to_string(
+                    Image.open(temp_path),
+                    lang='eng',
+                    config=config
+                )
+
+                results[config_name] = {
+                    "config": config,
+                    "russian": text_rus.strip(),
+                    "english": text_eng.strip(),
+                    "combined": pytesseract.image_to_string(
+                        Image.open(temp_path),
+                        lang='rus+eng',
+                        config=config
+                    ).strip()
+                }
+            except Exception as e:
+                results[config_name] = {"error": str(e)}
+
+        # Также получаем детальную информацию
+        from PIL import Image as PILImage
+        pil_image = PILImage.open(temp_path)
+
+        detailed = pytesseract.image_to_data(
+            pil_image,
+            lang='rus+eng',
+            config='--oem 3 --psm 6',
+            output_type=pytesseract.Output.DICT
+        )
+
+        # Анализируем confidence
+        confidences = [float(c) for c in detailed['conf'] if float(c) > 0]
+        avg_conf = sum(confidences) / len(confidences) if confidences else 0
+
+        results["analysis"] = {
+            "avg_confidence": avg_conf,
+            "total_words": len([t for t in detailed['text'] if t.strip()]),
+            "sample_words": detailed['text'][:10]
+        }
+
+        return results
+
+    finally:
+        os.unlink(temp_path)
 
 @router.post("/verify/{work_id}", response_model=TeacherVerificationResponse)
 async def verify_work(
