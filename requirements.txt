@@ -1,27 +1,27 @@
-fastapi
-uvicorn[standard]
-sqlmodel
-psycopg2-binary
-python-jose[cryptography]
+# Основные зависимости
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+sqlmodel==0.0.14
+python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
-bcrypt==3.2.2
-python-multipart
-aiofiles
-firebase-admin
-google-cloud-storage
-email-validator
-alembic
-pillow>=10.0.0
-opencv-python-headless
-easyocr==1.7.2
-sympy
-torch>=2.0.0
-transformers
-sentence-transformers
-numpy>=1.24.0
-scikit-learn
-pandas
-matplotlib
-celery
-redis
-requests
+python-multipart==0.0.6
+pydantic==2.5.0
+pydantic-settings==2.1.0
+
+# Для обработки изображений (легкие версии)
+opencv-python-headless==4.8.1.78
+numpy==1.24.3
+Pillow==10.1.0
+
+# OCR (опционально, для fallback)
+pytesseract==0.3.10
+
+# EasyOCR - только если хватит памяти
+# easyocr==1.7.2  # ЗАКОММЕНТИРУЕМ ДЛЯ НАЧАЛА
+
+# Для математического анализа
+sympy==1.12
+
+# Для асинхронных задач
+celery==5.3.4
+redis==5.0.1

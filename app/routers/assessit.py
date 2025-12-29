@@ -96,152 +96,86 @@ def process_image_from_bytes(image_bytes: bytes) -> dict:
 
 
 def process_image_sync(image_id: int, file_bytes: bytes, session: Session) -> dict:
-    """Синхронная обработка изображения из байтов с EasyOCR"""
+    """Упрощенная обработка изображения"""
     try:
         start_time = time.time()
 
-        # Обновляем статус на "processing"
         image = update_image_status(session, image_id, "processing")
         if not image:
             return {"success": False, "error": "Image not found"}
 
-        logger.info(f"Starting EasyOCR processing for image {image_id}")
-
-        # Обработка изображения EasyOCR
+        # Используем наш OCR движок
         ocr_result = ocr_engine.process_from_bytes(file_bytes)
 
-        if "error" in ocr_result:
-            error_msg = f"EasyOCR error: {ocr_result['error']}"
+        if not ocr_result.get("success", False):
+            error_msg = f"OCR error: {ocr_result.get('error', 'Unknown')}"
             update_image_status(session, image_id, "error", error_msg)
             return {"success": False, "error": error_msg}
 
         full_text = ocr_result.get("full_text", "")
         avg_confidence = ocr_result.get("average_confidence", 50.0)
 
-        logger.info(f"EasyOCR result for image {image_id}: {full_text[:100]}...")
-        logger.info(f"EasyOCR confidence: {avg_confidence}")
+        # Логируем для отладки
+        logger.info(f"OCR text for {image_id}: {full_text[:100]}...")
 
-        # Анализ решения
-        structure_analysis = solution_analyzer.analyze_solution_structure(full_text)
-
-        # Получаем данные задания
-        from ..models import Question
-        assignment = session.get(Assignment, image.assignment_id)
-        reference_data = {}
-
-        if assignment:
-            reference_data["reference_solution"] = assignment.reference_solution
-            reference_data["reference_answer"] = assignment.reference_answer
-
-        if image.question_id:
-            question = session.get(Question, image.question_id)
-            if question:
-                if not reference_data.get("reference_solution"):
-                    reference_data["reference_solution"] = question.step_by_step_solution
-                if not reference_data.get("reference_answer"):
-                    reference_data["reference_answer"] = question.correct_answer
-
-        # Сравнение с эталоном
-        comparison_result = solution_analyzer.compare_with_reference(
-            full_text,
-            reference_data.get("reference_solution"),
-            reference_data.get("reference_answer")
-        )
-
-        # Улучшенный расчет confidence для EasyOCR
+        # Упрощенный анализ
         text_length = len(full_text)
-        has_answer = structure_analysis.get('has_answer', False)
-        has_structure = structure_analysis.get('solution_type', 'unknown') != 'unstructured'
+        has_numbers = any(c.isdigit() for c in full_text)
+        has_equals = '=' in full_text
+        has_answer = any(word in full_text.lower() for word in ['ответ', 'answer'])
 
-        # Взвешенные факторы для EasyOCR
-        ocr_factor = avg_confidence / 100.0
-        length_factor = min(text_length / 100.0, 1.0)  # нормализуем длину
-        structure_factor = 0.7 if has_structure else 0.3
-        answer_factor = 0.8 if has_answer else 0.3
+        # Простой расчет confidence
+        length_factor = min(text_length / 100.0, 1.0)
+        content_factor = 0.3 if has_numbers else 0.1
+        answer_factor = 0.3 if has_answer else 0.1
 
-        if comparison_result and comparison_result.get('success'):
-            comparison_factor = comparison_result.get('comparison_score', 0.5)
-            answer_factor = max(answer_factor, comparison_factor)
-
-        # Комбинируем факторы (даем больше веса структуре для EasyOCR)
         total_confidence = (
-                ocr_factor * 0.3 +  # 30% качество OCR
-                length_factor * 0.2 +  # 20% длина текста
-                structure_factor * 0.3 +  # 30% структура решения
-                answer_factor * 0.2  # 20% наличие ответа
+                (avg_confidence / 100.0) * 0.4 +
+                length_factor * 0.3 +
+                content_factor * 0.2 +
+                answer_factor * 0.1
         )
 
-        # Определяем уровень проверки (более гибко для EasyOCR)
-        if total_confidence >= 0.65:
+        # Определяем уровень
+        if total_confidence >= 0.6:
             check_level = "level_1"
-            auto_feedback = "✅ Работа распознана, можно проверить автоматически."
-        elif total_confidence >= 0.35:
+            auto_feedback = "✅ Можно проверить автоматически"
+        elif total_confidence >= 0.3:
             check_level = "level_2"
-            auto_feedback = "⚠️ Требуется внимание учителя."
+            auto_feedback = "⚠️ Требует внимания"
         else:
             check_level = "level_3"
-            auto_feedback = "❌ Требуется ручная проверка."
+            auto_feedback = "❌ Ручная проверка"
 
-        # Предлагаем оценку
-        suggested_grade = None
-        if total_confidence > 0.5:
-            suggested_grade = min(total_confidence * 100, 100)
-        elif total_confidence > 0.3:
-            suggested_grade = total_confidence * 100 * 0.8
-
-        # Создаем запись распознанного решения
+        # Создаем решение
         solution_data = {
             "image_id": image_id,
             "extracted_text": full_text,
             "text_confidence": avg_confidence,
             "formulas_count": len(ocr_result.get("formulas", [])),
-            "extracted_answer": structure_analysis.get('extracted_answer'),
-            "answer_confidence": comparison_result.get('comparison_score', 0.0) if comparison_result else None,
-            "ocr_confidence": ocr_factor,
-            "solution_structure_confidence": structure_factor,
-            "formula_confidence": 0.5 if ocr_result.get("formulas") else 0.1,
-            "answer_match_confidence": answer_factor,
+            "ocr_confidence": avg_confidence / 100.0,
+            "solution_structure_confidence": 0.5 if has_equals else 0.2,
+            "answer_match_confidence": 0.5 if has_answer else 0.2,
             "total_confidence": total_confidence,
             "check_level": check_level,
-            "suggested_grade": suggested_grade,
             "auto_feedback": auto_feedback,
             "processing_time_ms": int((time.time() - start_time) * 1000)
         }
 
-        if ocr_result.get("formulas"):
-            solution_data["extracted_formulas_json"] = json.dumps(
-                ocr_result.get("formulas", []),
-                ensure_ascii=False
-            )
-
-        if structure_analysis.get('steps'):
-            solution_data["solution_steps_json"] = json.dumps(
-                structure_analysis.get('steps', []),
-                ensure_ascii=False
-            )
-
         recognized_solution = create_recognized_solution(session, **solution_data)
         update_image_status(session, image_id, "processed")
-
-        processing_time = int((time.time() - start_time) * 1000)
-        logger.info(f"Successfully processed image {image_id} in {processing_time}ms")
 
         return {
             "success": True,
             "image_id": image_id,
             "solution_id": recognized_solution.id,
-            "processing_time_ms": processing_time,
             "confidence_score": total_confidence,
-            "check_level": check_level,
-            "needs_attention": check_level != "level_1"
+            "check_level": check_level
         }
 
     except Exception as e:
-        logger.error(f"Error processing image {image_id}: {str(e)}", exc_info=True)
-        try:
-            update_image_status(session, image_id, "error", str(e))
-        except:
-            pass
+        logger.error(f"Error processing {image_id}: {str(e)}")
+        update_image_status(session, image_id, "error", str(e))
         return {"success": False, "error": str(e)}
 
 @router.post("/upload-work")
