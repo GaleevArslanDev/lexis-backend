@@ -275,36 +275,37 @@ class SolutionAnalyzer:
             return "very_poor"
 
     def extract_final_answer(self, text: str) -> Optional[str]:
-        """Извлечь финальный ответ"""
-        # Пробуем несколько стратегий
+        """Извлечь финальный ответ из текста (упрощенная версия для EasyOCR)"""
+        try:
+            # Сначала ищем явные ответы
+            answer_patterns = [
+                r'Ответ\s*[:=]\s*([0-9.,]+)',
+                r'[Aa]nswer\s*[:=]\s*([0-9.,]+)',
+                r'=\s*([0-9.,]+)\s*$',
+                r'получим\s*([0-9.,]+)',
+                r'равно\s*([0-9.,]+)'
+            ]
 
-        # 1. Ищем явные пометки "Ответ:"
-        answer_patterns = [
-            r'Ответ\s*[:=]\s*([^\n]+)',
-            r'[Aa]nswer\s*[:=]\s*([^\n]+)',
-            r'=\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s*$',
-            r'получим\s*([+-]?\d*\.?\d+)',
-            r'равно\s*([+-]?\d*\.?\d+)',
-            r'≈\s*([+-]?\d*\.?\d+)',
-            r'~?\s*([+-]?\d*\.?\d+)\s*(?:$|\.|,)'
-        ]
+            for pattern in answer_patterns:
+                matches = re.findall(pattern, text)
+                if matches:
+                    # Берем последний найденный (скорее всего финальный)
+                    return matches[-1].strip()
 
-        for pattern in answer_patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            if matches:
-                # Возвращаем последний найденный (скорее всего финальный)
-                return matches[-1].strip()
+            # Если явных ответов нет, ищем числа в конце
+            lines = text.strip().split('\n')
+            if lines:
+                last_line = lines[-1].strip()
+                # Ищем числа в последней строке
+                numbers = re.findall(r'[0-9.,]+', last_line)
+                if numbers:
+                    return numbers[-1]
 
-        # 2. Ищем числа в конце текста
-        lines = text.strip().split('\n')
-        if lines:
-            last_line = lines[-1].strip()
-            # Ищем числа в последней строке
-            numbers = re.findall(r'[+-]?\d+\.?\d*', last_line)
-            if numbers:
-                return numbers[-1]
+            return None
 
-        return None
+        except Exception as e:
+            logger.error(f"Error extracting answer: {str(e)}")
+            return None
 
     def compare_with_reference(
             self,

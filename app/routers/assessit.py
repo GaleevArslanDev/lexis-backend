@@ -11,8 +11,6 @@ from datetime import datetime
 import logging
 import cv2
 import numpy as np
-import pytesseract
-from PIL import Image as PILImage
 
 from ..db import get_session
 from ..dependencies.auth import get_current_user
@@ -98,7 +96,7 @@ def process_image_from_bytes(image_bytes: bytes) -> dict:
 
 
 def process_image_sync(image_id: int, file_bytes: bytes, session: Session) -> dict:
-    """Синхронная обработка изображения из байтов"""
+    """Синхронная обработка изображения из байтов с EasyOCR"""
     try:
         start_time = time.time()
 
@@ -107,50 +105,21 @@ def process_image_sync(image_id: int, file_bytes: bytes, session: Session) -> di
         if not image:
             return {"success": False, "error": "Image not found"}
 
-        logger.info(f"Starting processing for image {image_id}")
+        logger.info(f"Starting EasyOCR processing for image {image_id}")
 
-        # Конвертируем байты в изображение OpenCV
-        image_cv2 = bytes_to_cv2_image(file_bytes)
-        if image_cv2 is None:
-            error_msg = "Failed to convert bytes to image"
+        # Обработка изображения EasyOCR
+        ocr_result = ocr_engine.process_from_bytes(file_bytes)
+
+        if "error" in ocr_result:
+            error_msg = f"EasyOCR error: {ocr_result['error']}"
             update_image_status(session, image_id, "error", error_msg)
             return {"success": False, "error": error_msg}
 
-        # Сначала пробуем улучшенную обработку для рукописных текстов
-        ocr_result = ocr_engine.process_handwritten_text(image_cv2)
-
-        # Если не получилось, пробуем стандартный метод
-        if not ocr_result.get("success", False):
-            logger.info(f"Handwritten OCR failed, trying standard method for image {image_id}")
-
-            # Сохраняем временный файл
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                temp_path = tmp.name
-                cv2.imwrite(temp_path, image_cv2)
-
-            try:
-                ocr_result = ocr_engine.process_complete_page(
-                    temp_path,
-                    extract_formulas=True,
-                    extract_answers=True
-                )
-            finally:
-                import os
-                os.unlink(temp_path)
-
-        if "error" in ocr_result or not ocr_result.get("success", True):
-            error_msg = f"OCR error: {ocr_result.get('error', 'Unknown error')}"
-            update_image_status(session, image_id, "error", error_msg)
-            return {"success": False, "error": error_msg}
-
-        # Получаем текст
         full_text = ocr_result.get("full_text", "")
         avg_confidence = ocr_result.get("average_confidence", 50.0)
 
-        # Логируем результат OCR для отладки
-        logger.info(f"OCR result for image {image_id}: {full_text[:100]}...")
-        logger.info(f"OCR confidence: {avg_confidence}")
+        logger.info(f"EasyOCR result for image {image_id}: {full_text[:100]}...")
+        logger.info(f"EasyOCR confidence: {avg_confidence}")
 
         # Анализ решения
         structure_analysis = solution_analyzer.analyze_solution_structure(full_text)
@@ -179,47 +148,45 @@ def process_image_sync(image_id: int, file_bytes: bytes, session: Session) -> di
             reference_data.get("reference_answer")
         )
 
-        # Улучшенный расчет confidence
+        # Улучшенный расчет confidence для EasyOCR
         text_length = len(full_text)
-        has_structure = structure_analysis.get('has_solution_section', False) or structure_analysis.get('has_answer',
-                                                                                                        False)
+        has_answer = structure_analysis.get('has_answer', False)
+        has_structure = structure_analysis.get('solution_type', 'unknown') != 'unstructured'
 
-        # Взвешенные факторы
+        # Взвешенные факторы для EasyOCR
         ocr_factor = avg_confidence / 100.0
-        length_factor = min(text_length / 200.0, 1.0)  # нормализуем длину
-        structure_factor = 1.0 if has_structure else 0.3
+        length_factor = min(text_length / 100.0, 1.0)  # нормализуем длину
+        structure_factor = 0.7 if has_structure else 0.3
+        answer_factor = 0.8 if has_answer else 0.3
 
         if comparison_result and comparison_result.get('success'):
-            answer_factor = comparison_result.get('comparison_score', 0.5)
-        else:
-            answer_factor = 0.5 if text_length > 10 else 0.1
+            comparison_factor = comparison_result.get('comparison_score', 0.5)
+            answer_factor = max(answer_factor, comparison_factor)
 
-        # Комбинируем факторы с весами
+        # Комбинируем факторы (даем больше веса структуре для EasyOCR)
         total_confidence = (
-                ocr_factor * 0.4 +
-                length_factor * 0.2 +
-                structure_factor * 0.2 +
-                answer_factor * 0.2
+                ocr_factor * 0.3 +  # 30% качество OCR
+                length_factor * 0.2 +  # 20% длина текста
+                structure_factor * 0.3 +  # 30% структура решения
+                answer_factor * 0.2  # 20% наличие ответа
         )
 
-        # Определяем уровень проверки
-        if total_confidence >= 0.7:
+        # Определяем уровень проверки (более гибко для EasyOCR)
+        if total_confidence >= 0.65:
             check_level = "level_1"
-            auto_feedback = "✅ Работа распознана хорошо, можно проверить автоматически."
-        elif total_confidence >= 0.4:
+            auto_feedback = "✅ Работа распознана, можно проверить автоматически."
+        elif total_confidence >= 0.35:
             check_level = "level_2"
-            auto_feedback = "⚠️ Требуется внимание учителя: некоторые элементы требуют проверки."
+            auto_feedback = "⚠️ Требуется внимание учителя."
         else:
             check_level = "level_3"
-            auto_feedback = "❌ Требуется ручная проверка: низкое качество распознавания."
+            auto_feedback = "❌ Требуется ручная проверка."
 
         # Предлагаем оценку
         suggested_grade = None
-        if answer_factor > 0.7:
-            suggested_grade = min(total_confidence * 100 * 1.2, 100)
-        elif answer_factor > 0.4:
-            suggested_grade = total_confidence * 100
-        elif answer_factor > 0.2:
+        if total_confidence > 0.5:
+            suggested_grade = min(total_confidence * 100, 100)
+        elif total_confidence > 0.3:
             suggested_grade = total_confidence * 100 * 0.8
 
         # Создаем запись распознанного решения
@@ -457,95 +424,6 @@ async def get_work_details(
         processing_time_ms=solution.processing_time_ms or 0,
         processed_at=solution.recognized_at
     )
-
-
-@router.post("/debug-ocr")
-async def debug_ocr(
-        file: UploadFile = File(...),
-        session: Session = Depends(get_session),
-        current_user: User = Depends(require_role("teacher"))
-):
-    """Эндпоинт для отладки OCR"""
-
-    # Читаем файл
-    file_content = await file.read()
-
-    # Конвертируем в OpenCV
-    image_cv2 = bytes_to_cv2_image(file_content)
-    if image_cv2 is None:
-        raise HTTPException(status_code=400, detail="Failed to decode image")
-
-    # Сохраняем временно
-    import tempfile
-    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-        temp_path = tmp.name
-        cv2.imwrite(temp_path, image_cv2)
-
-    results = {}
-
-    try:
-        # Тестируем различные конфигурации
-        configs = [
-            ("psm6", "--oem 3 --psm 6"),
-            ("psm4", "--oem 3 --psm 4"),
-            ("psm11", "--oem 3 --psm 11"),
-            ("psm3", "--oem 3 --psm 3"),
-        ]
-
-        for config_name, config in configs:
-            try:
-                # Пробуем с русским языком
-                text_rus = pytesseract.image_to_string(
-                    PILImage.open(temp_path),
-                    lang='rus',
-                    config=config
-                )
-
-                # Пробуем с английским
-                text_eng = pytesseract.image_to_string(
-                    PILImage.open(temp_path),
-                    lang='eng',
-                    config=config
-                )
-
-                results[config_name] = {
-                    "config": config,
-                    "russian": text_rus.strip(),
-                    "english": text_eng.strip(),
-                    "combined": pytesseract.image_to_string(
-                        PILImage.open(temp_path),
-                        lang='rus+eng',
-                        config=config
-                    ).strip()
-                }
-            except Exception as e:
-                results[config_name] = {"error": str(e)}
-
-        # Также получаем детальную информацию
-        pil_image = PILImage.open(temp_path)
-
-        detailed = pytesseract.image_to_data(
-            pil_image,
-            lang='rus+eng',
-            config='--oem 3 --psm 6',
-            output_type=pytesseract.Output.DICT
-        )
-
-        # Анализируем confidence
-        confidences = [float(c) for c in detailed['conf'] if float(c) > 0]
-        avg_conf = sum(confidences) / len(confidences) if confidences else 0
-
-        results["analysis"] = {
-            "avg_confidence": avg_conf,
-            "total_words": len([t for t in detailed['text'] if t.strip()]),
-            "sample_words": detailed['text'][:10]
-        }
-
-        return results
-
-    finally:
-        import os
-        os.unlink(temp_path)
 
 @router.post("/verify/{work_id}", response_model=TeacherVerificationResponse)
 async def verify_work(
