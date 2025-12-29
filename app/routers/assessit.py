@@ -11,6 +11,8 @@ from datetime import datetime
 import logging
 import cv2
 import numpy as np
+import pytesseract
+from PIL import Image as PILImage
 
 from ..db import get_session
 from ..dependencies.auth import get_current_user
@@ -114,25 +116,28 @@ def process_image_sync(image_id: int, file_bytes: bytes, session: Session) -> di
             update_image_status(session, image_id, "error", error_msg)
             return {"success": False, "error": error_msg}
 
-        # Сохраняем временный файл для отладки
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-            temp_path = tmp.name
-            cv2.imwrite(temp_path, image_cv2)
+        # Сначала пробуем улучшенную обработку для рукописных текстов
+        ocr_result = ocr_engine.process_handwritten_text(image_cv2)
 
-        try:
-            # Используем специализированную обработку для рукописных текстов
-            ocr_result = ocr_engine.process_handwritten_text(image_cv2)
+        # Если не получилось, пробуем стандартный метод
+        if not ocr_result.get("success", False):
+            logger.info(f"Handwritten OCR failed, trying standard method for image {image_id}")
 
-            if not ocr_result.get("success"):
-                # Пробуем стандартный метод как fallback
+            # Сохраняем временный файл
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                temp_path = tmp.name
+                cv2.imwrite(temp_path, image_cv2)
+
+            try:
                 ocr_result = ocr_engine.process_complete_page(
                     temp_path,
                     extract_formulas=True,
                     extract_answers=True
                 )
-        finally:
-            os.unlink(temp_path)
+            finally:
+                import os
+                os.unlink(temp_path)
 
         if "error" in ocr_result or not ocr_result.get("success", True):
             error_msg = f"OCR error: {ocr_result.get('error', 'Unknown error')}"
@@ -491,14 +496,14 @@ async def debug_ocr(
             try:
                 # Пробуем с русским языком
                 text_rus = pytesseract.image_to_string(
-                    Image.open(temp_path),
+                    PILImage.open(temp_path),
                     lang='rus',
                     config=config
                 )
 
                 # Пробуем с английским
                 text_eng = pytesseract.image_to_string(
-                    Image.open(temp_path),
+                    PILImage.open(temp_path),
                     lang='eng',
                     config=config
                 )
@@ -508,7 +513,7 @@ async def debug_ocr(
                     "russian": text_rus.strip(),
                     "english": text_eng.strip(),
                     "combined": pytesseract.image_to_string(
-                        Image.open(temp_path),
+                        PILImage.open(temp_path),
                         lang='rus+eng',
                         config=config
                     ).strip()
@@ -517,7 +522,6 @@ async def debug_ocr(
                 results[config_name] = {"error": str(e)}
 
         # Также получаем детальную информацию
-        from PIL import Image as PILImage
         pil_image = PILImage.open(temp_path)
 
         detailed = pytesseract.image_to_data(
@@ -540,6 +544,7 @@ async def debug_ocr(
         return results
 
     finally:
+        import os
         os.unlink(temp_path)
 
 @router.post("/verify/{work_id}", response_model=TeacherVerificationResponse)

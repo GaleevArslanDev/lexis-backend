@@ -209,6 +209,7 @@ class OCREngine:
                 custom_config = r'--oem 3 --psm 6 -l rus+eng+equ'
 
                 # Распознавание с разными параметрами
+                from PIL import Image
                 pil_image = Image.fromarray(dilated)
 
                 # Основной текст
@@ -251,8 +252,8 @@ class OCREngine:
                 # Ищем формулы
                 formulas = self.extract_formulas(dilated)
 
-                # Ищем ответы
-                answer_candidates = self.extract_answer_candidates_from_text(text)
+                # Ищем ответы (используем существующий метод для текста)
+                answer_candidates = self.extract_answer_candidates_from_text(text) if text else []
 
                 return {
                     "success": True,
@@ -265,11 +266,45 @@ class OCREngine:
                 }
 
             finally:
+                import os
                 os.unlink(temp_path)
 
         except Exception as e:
             logger.error(f"Error processing handwritten text: {str(e)}")
             return {"success": False, "error": str(e)}
+
+    def extract_answer_candidates_from_text(self, text: str) -> List[Dict]:
+        """Найти кандидаты на ответ в тексте"""
+        try:
+            answer_patterns = [
+                r'Ответ\s*[:=]\s*([^\n]+)',
+                r'Ответ\s*[:=]\s*\n?\s*([^\n]+)',
+                r'[Aa]nswer\s*[:=]\s*([^\n]+)',
+                r'=\s*([0-9.,]+)',  # Изолированное равенство с числом
+                r'получим\s*([0-9.,]+)',
+                r'равно\s*([0-9.,]+)'
+            ]
+
+            import re
+            candidates = []
+
+            for pattern in answer_patterns:
+                matches = re.finditer(pattern, text, re.IGNORECASE)
+                for match in matches:
+                    answer_text = match.group(1).strip()
+                    candidate = {
+                        'text': answer_text,
+                        'pattern': pattern,
+                        'position': (match.start(1), match.end(1)),
+                        'context': text[max(0, match.start() - 50):match.end() + 50]
+                    }
+                    candidates.append(candidate)
+
+            return candidates
+
+        except Exception as e:
+            logger.error(f"Error extracting answer candidates from text: {str(e)}")
+            return []
 
     def extract_formulas(self, image: np.ndarray) -> List[Dict]:
         """Выделить математические формулы"""
