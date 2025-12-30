@@ -35,7 +35,7 @@ COPY --chown=appuser:appuser . .
 # Оптимизация переменных окружения Python
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    OMP_NUM_THREADS=1  # Ограничиваем потоки для OpenMP
+    OMP_NUM_THREADS=1
 
 # Запуск приложения
 CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "10000", "--workers", "1"]
