@@ -1,5 +1,5 @@
 # Dockerfile
-FROM python:3.9-slim  # Python 3.9 стабильнее для ML
+FROM python:3.9-slim
 
 # Установка системных зависимостей МИНИМАЛЬНЫМ набором
 RUN apt-get update && apt-get install -y \
