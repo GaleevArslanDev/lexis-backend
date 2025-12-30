@@ -28,7 +28,7 @@ class UserRead(BaseModel):
 class Token(BaseModel):
     access_token: str
     token_type: str
-    jti: str | None = None
+    jti: Optional[int] = None
 
     model_config = ConfigDict(from_attributes=True)
 
