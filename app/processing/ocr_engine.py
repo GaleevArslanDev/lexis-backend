@@ -137,5 +137,5 @@ def get_ocr_engine():
     """Ленивый геттер для OCR движка"""
     global _OCR_ENGINE
     if _OCR_ENGINE is None:
-        _OCR_ENGINE = PaddleOCREngine(lang='ru')
+        _OCR_ENGINE = OCREngine(lang='ru')
     return _OCR_ENGINE

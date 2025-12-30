@@ -1,3 +1,5 @@
+from typing import Optional
+
 from sqlmodel import Session, select
 from ..models import MistakeStat
 
@@ -12,7 +14,7 @@ def create_mistake_stat(session: Session, class_id: int, question_id: int, mista
 
 
 # --- Read ---
-def get_mistake_stat(session: Session, class_id: int, question_id: int, mistake_type: str) -> MistakeStat | None:
+def get_mistake_stat(session: Session, class_id: int, question_id: int, mistake_type: str) -> Optional[MistakeStat]:
     return session.exec(
         select(MistakeStat).where(
             MistakeStat.class_id == class_id,
