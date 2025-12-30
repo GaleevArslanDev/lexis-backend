@@ -1,6 +1,9 @@
 from fastapi import FastAPI
 from .routers import auth, classes, assignments, files, ai, schools, reports, logs, users, assessit
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+import gc
+import os
 
 app = FastAPI(
     title="Лексис - backend",
@@ -17,6 +20,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+gc.collect()
+
 # Подключаем все роутеры
 app.include_router(auth.router)
 app.include_router(classes.router)
@@ -32,8 +38,17 @@ app.include_router(assessit.router)  # Новый роутер для AssessIt
 
 @app.on_event("startup")
 def on_startup():
-    print("Lexis backend started with AssessIt system")
-    print("Files are processed in memory without saving to disk")
+    """Оптимизация при запуске"""
+    # Устанавливаем переменные окружения для оптимизации памяти
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+
+    print("AssessIt backend starting with memory optimization")
+    print(f"Available memory optimization active")
+
+    # Принудительный сбор мусора
+    gc.collect()
 
 
 @app.get("/")
@@ -50,6 +65,14 @@ async def root():
             "docs": "/docs"
         }
     }
+
+@app.on_event("shutdown")
+def shutdown_event():
+    """Очистка при завершении"""
+    import sys
+    if 'app.processing.ocr_engine' in sys.modules:
+        del sys.modules['app.processing.ocr_engine']
+    gc.collect()
 
 
 @app.get("/health")

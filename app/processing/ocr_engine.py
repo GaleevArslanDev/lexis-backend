@@ -1,152 +1,110 @@
-# app/processing/ocr_engine.py - ЛЕГКОВЕСНЫЙ ВАРИАНТ
 import cv2
 import numpy as np
-import json
-import os
 from typing import Dict, List, Optional
 import logging
-import re
-from functools import lru_cache
+from paddleocr import PaddleOCR
 
 logger = logging.getLogger(__name__)
 
-# Глобальная переменная для pipeline
-_PIPELINE = None
-
-
-def get_keras_ocr_pipeline():
-    """Ленивая загрузка Keras-OCR pipeline"""
-    global _PIPELINE
-
-    if _PIPELINE is None:
-        try:
-            import keras_ocr
-            logger.info("Loading Keras-OCR pipeline (this may take a moment)...")
-            # Используем легковесный детектор и распознаватель
-            _PIPELINE = keras_ocr.pipeline.Pipeline()
-            logger.info("Keras-OCR pipeline loaded successfully")
-        except ImportError as e:
-            logger.error(f"Keras-OCR not installed: {e}")
-            _PIPELINE = None
-        except Exception as e:
-            logger.error(f"Failed to load Keras-OCR: {e}")
-            _PIPELINE = None
-
-    return _PIPELINE
-
 
 class OCREngine:
-    def __init__(self, language: str = "ru"):
-        self.language = language
+    def __init__(self, lang: str = 'ru'):
+        # ЛЕНИВАЯ ИНИЦИАЛИЗАЦИЯ - модель загрузится только при первом вызове
+        self.lang = lang
+        self._ocr = None
+        self._model_loaded = False
+
+    def _ensure_loaded(self):
+        """Загружает модель только при необходимости"""
+        if not self._model_loaded:
+            logger.info("Loading PaddleOCR model (this may take a moment)...")
+            # Используем легкие модели для экономии памяти
+            self._ocr = PaddleOCR(
+                use_angle_cls=True,
+                lang=self.lang,
+                det_db_thresh=0.3,
+                det_db_box_thresh=0.5,
+                use_gpu=False,  # На Render нет GPU
+                enable_mkldnn=True,  # Ускорение CPU
+                use_tensorrt=False,
+                cls_model_dir='',  # Не использовать классификатор
+                show_log=False  # Отключить логи для экономии памяти
+            )
+            self._model_loaded = True
+            logger.info("PaddleOCR model loaded")
 
     def process_from_bytes(self, image_bytes: bytes) -> Dict:
-        """Обработка изображения с Keras-OCR"""
+        """Обработка изображения из байтов"""
         try:
             # Конвертируем байты в изображение
             nparr = np.frombuffer(image_bytes, np.uint8)
             image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
             if image is None:
                 return {"error": "Failed to decode image"}
 
-            # Предобработка для рукописного текста
-            processed = self.preprocess_for_handwriting(image)
-
-            # Получаем pipeline
-            pipeline = get_keras_ocr_pipeline()
-            if pipeline is None:
-                return self._process_fallback(processed)
+            # Обеспечиваем загрузку модели
+            self._ensure_loaded()
 
             # Выполняем OCR
-            predictions = pipeline.recognize([processed])
+            result = self._ocr.ocr(image, cls=False)
 
-            # Извлекаем текст и уверенность
-            if predictions and len(predictions[0]) > 0:
-                texts = []
-                confidences = []
+            # Извлекаем текст и координаты
+            full_text = ""
+            confidences = []
 
-                for text, box in predictions[0]:
-                    texts.append(text)
-                    # Keras-OCR не возвращает уверенность напрямую, используем эвристику
-                    confidences.append(0.8)  # Примерная уверенность
+            if result and result[0]:
+                for line in result[0]:
+                    if line and len(line) >= 2:
+                        text = line[1][0] if isinstance(line[1], (list, tuple)) else ""
+                        confidence = line[1][1] if isinstance(line[1], (list, tuple)) else 0.5
+                        full_text += text + " "
+                        confidences.append(confidence)
 
-                full_text = " ".join(texts)
-                avg_confidence = sum(confidences) / len(confidences) * 100 if confidences else 50
-            else:
-                full_text = ""
-                avg_confidence = 0
+            avg_confidence = sum(confidences) / len(confidences) * 100 if confidences else 50.0
 
             return {
                 "success": True,
-                "full_text": full_text,
+                "full_text": full_text.strip(),
                 "average_confidence": avg_confidence,
                 "character_count": len(full_text),
                 "word_count": len(full_text.split()),
-                "formulas": self.extract_formulas(full_text),
-                "answer_candidates": self.extract_answers(full_text)
+                "formulas": self._extract_formulas(full_text),
+                "answer_candidates": self._extract_answers(full_text),
+                "raw_result": result
             }
 
         except Exception as e:
-            logger.error(f"Error processing image: {str(e)}")
-            return {"error": str(e), "success": False}
+            logger.error(f"Error in PaddleOCR: {str(e)}")
+            return {"success": False, "error": str(e)}
 
-    def preprocess_for_handwriting(self, image: np.ndarray) -> np.ndarray:
-        """Оптимизированная предобработка для рукописного текста"""
-        try:
-            # Конвертируем в grayscale
-            if len(image.shape) == 3:
-                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            else:
-                gray = image.copy()
-
-            # Улучшение контраста (упрощенное)
-            # Используем гистограммное выравнивание
-            equalized = cv2.equalizeHist(gray)
-
-            # Легкое размытие для удаления шума
-            blurred = cv2.GaussianBlur(equalized, (3, 3), 0)
-
-            # Пороговая обработка
-            _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-            # Инвертируем если нужно (черный текст на белом фоне)
-            if np.mean(binary) > 127:
-                binary = cv2.bitwise_not(binary)
-
-            # Конвертируем обратно в RGB для Keras-OCR
-            rgb = cv2.cvtColor(binary, cv2.COLOR_GRAY2RGB)
-
-            return rgb
-
-        except Exception as e:
-            logger.error(f"Error in preprocessing: {str(e)}")
-            return image
-
-    def extract_formulas(self, text: str) -> List[Dict]:
-        """Извлечение формул из текста"""
+    def _extract_formulas(self, text: str) -> List[Dict]:
+        """Извлечение формул (упрощенное)"""
         formulas = []
-
-        # Простые паттерны для математических выражений
-        patterns = [
-            r'[a-zA-Z]\s*=\s*[^=]+',  # x = выражение
-            r'\d+\s*[+\-*/]\s*\d+',  # 5 + 3, 4*2
-            r'[0-9]+\s*=\s*[0-9]+',  # 150 = 150
-            r'[a-zA-Z]:?\s*\d+',  # x: 91, k=12
+        # Паттерны для математических выражений
+        import re
+        math_patterns = [
+            r'[a-zA-Zα-ωΑ-Ω]\s*[=≡≈]\s*[^=\n]+',
+            r'\d+\s*[+\-*/^]\s*\d+',
+            r'[Ss]\s*=\s*[^=\n]+',
+            r'[Vv]\s*=\s*[^=\n]+'
         ]
 
-        for pattern in patterns:
+        for pattern in math_patterns:
             matches = re.finditer(pattern, text)
             for match in matches:
-                formula_text = match.group(0).strip()
+                formula = match.group(0).strip()
                 formulas.append({
-                    'latex': formula_text,
+                    'latex': formula,
                     'confidence': 0.7,
-                    'original_text': formula_text
+                    'original_text': formula
                 })
 
         return formulas
 
-    def extract_answers(self, text: str) -> List[Dict]:
-        """Извлечение ответов из текста"""
+    def _extract_answers(self, text: str) -> List[Dict]:
+        """Извлечение ответов"""
+        import re
         candidates = []
 
         patterns = [
@@ -154,62 +112,30 @@ class OCREngine:
             r'[Aa]nswer\s*[:=]\s*([0-9.,]+)',
             r'=\s*([0-9.,]+)\s*$',
             r'получим\s*([0-9.,]+)',
-            r'равно\s*([0-9.,]+)',
+            r'равно\s*([0-9.,]+)'
         ]
 
         for pattern in patterns:
             matches = re.finditer(pattern, text, re.IGNORECASE)
             for match in matches:
                 if match.lastindex:
-                    answer_text = match.group(1).strip()
+                    answer = match.group(1).strip()
                     candidates.append({
-                        'text': answer_text,
+                        'text': answer,
                         'pattern': pattern,
                         'context': match.group(0)
                     })
 
         return candidates
 
-    def _process_fallback(self, image: np.ndarray) -> Dict:
-        """Fallback обработка - ищем цифры и буквы"""
-        try:
-            # Конвертируем в grayscale
-            if len(image.shape) == 3:
-                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            else:
-                gray = image.copy()
 
-            # Простая бинаризация
-            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+# Глобальный инстанс для reuse
+_OCR_ENGINE = None
 
-            # Инвертируем если нужно
-            if np.mean(binary) > 127:
-                binary = cv2.bitwise_not(binary)
 
-            # Ищем контуры символов
-            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-            # Простая логика: считаем что каждый контур - это символ
-            char_count = len(contours)
-
-            # Очень упрощенная логика - если есть контуры, предполагаем текст
-            if char_count > 10:
-                text = f"[Работа содержит ~{char_count} символов]"
-                confidence = 50
-            else:
-                text = ""
-                confidence = 0
-
-            return {
-                "success": True,
-                "full_text": text,
-                "average_confidence": confidence,
-                "character_count": len(text),
-                "word_count": len(text.split()),
-                "formulas": [],
-                "answer_candidates": []
-            }
-
-        except Exception as e:
-            logger.error(f"Fallback error: {str(e)}")
-            return {"success": False, "error": str(e)}
+def get_ocr_engine():
+    """Ленивый геттер для OCR движка"""
+    global _OCR_ENGINE
+    if _OCR_ENGINE is None:
+        _OCR_ENGINE = PaddleOCREngine(lang='ru')
+    return _OCR_ENGINE
