@@ -1,41 +1,47 @@
-# Dockerfile
-FROM python:3.9-slim
+FROM python:3.9-slim-bullseye
 
-# Установка системных зависимостей МИНИМАЛЬНЫМ набором
-RUN apt-get update && apt-get install -y \
-    libgl1-mesa-glx \
+# Установка системных зависимостей - ОПТИМИЗИРОВАННЫЙ НАБОР
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
-    libxrender-dev \
+    libxrender1 \
     libgomp1 \
+    libhdf5-dev \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# Создание пользователя для безопасности (опционально, но рекомендуется)
+# Создаем пользователя для безопасности
 RUN useradd -m -u 1000 appuser
 WORKDIR /app
 RUN chown appuser:appuser /app
 USER appuser
 
-# Копируем requirements первыми для лучшего кэширования
+# Копируем зависимости
 COPY --chown=appuser:appuser requirements.txt .
 
-# Устанавливаем Python зависимости с оптимизацией
+# Оптимизация установки pip
 ENV PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
 
-RUN pip install --user --no-cache-dir \
-    --no-warn-script-location \
-    -r requirements.txt
+# Устанавливаем Python зависимости
+RUN pip install --user --no-cache-dir --no-warn-script-location -r requirements.txt
+
+# Добавляем bin пользователя в PATH
+ENV PATH="/home/appuser/.local/bin:${PATH}"
 
 # Копируем приложение
 COPY --chown=appuser:appuser . .
 
-# Оптимизация переменных окружения Python
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    OMP_NUM_THREADS=1
+# Оптимизация для CPU и памяти
+ENV OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    PADDLE_PROCESSOR=cpu \
+    TF_CPP_MIN_LOG_LEVEL=3
 
-# Запуск приложения
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "10000", "--workers", "1"]
+# Запуск приложения с одним воркером для экономии памяти
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "10000", "--workers", "1"]
