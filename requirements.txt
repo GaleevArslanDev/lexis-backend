@@ -1,21 +1,21 @@
 # ЯДРО ПРИЛОЖЕНИЯ
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-sqlmodel==0.0.14
-python-jose[cryptography]==3.3.0
-passlib[bcrypt]==1.7.4
-pydantic==2.5.0
+fastapi
+uvicorn[standard]
+sqlmodel
+python-jose[cryptography]
+passlib[bcrypt]
+pydantic
 
 # БАЗА ДАННЫХ
-psycopg2-binary==2.9.9
-sqlalchemy==2.0.23
+psycopg2-binary
+sqlalchemy
 
 # OCR и обработка изображений
-paddlepaddle==2.5.0
-paddleocr==2.7.0.3
-opencv-python-headless==4.8.1.78
-Pillow==10.1.0
-numpy==1.24.3
+paddlepaddle
+paddleocr
+opencv-python-headless
+Pillow
+numpy
 
 # Математический анализ
-sympy==1.12
+sympy
