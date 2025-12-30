@@ -134,7 +134,7 @@ class ActionLog(SQLModel, table=True):
     target_type: str
     target_id: int
     timestamp: datetime = Field(default_factory=datetime.utcnow)
-    details: str | None = None
+    details: Optional[str] = None
 
 
 class RefreshToken(SQLModel, table=True):
