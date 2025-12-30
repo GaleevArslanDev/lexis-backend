@@ -1,3 +1,5 @@
+from typing import Optional
+
 from fastapi import APIRouter, Depends, Query
 from sqlmodel import Session
 from datetime import datetime
@@ -11,10 +13,10 @@ router = APIRouter(prefix="/logs", tags=["logs"])
 
 @router.get("/me", response_model=dict)
 def my_logs(
-        from_date: datetime | None = Query(None),
-        to_date: datetime | None = Query(None),
-        action_type: str | None = Query(None),
-        target_type: str | None = Query(None),
+        from_date: Optional[datetime] = Query(None),
+        to_date: Optional[datetime] = Query(None),
+        action_type: Optional[str] = Query(None),
+        target_type: Optional[str] = Query(None),
         offset: int = Query(0, ge=0),
         limit: int = Query(50, ge=1, le=100),
         session: Session = Depends(get_session),
@@ -48,11 +50,11 @@ def my_logs(
 
 @router.get("/", response_model=dict)
 def all_logs(
-    user_id: int | None = Query(None),
-    from_date: datetime | None = Query(None),
-    to_date: datetime | None = Query(None),
-    action_type: str | None = Query(None),
-    target_type: str | None = Query(None),
+    user_id: Optional[int] = Query(None),
+    from_date: Optional[datetime] = Query(None),
+    to_date: Optional[datetime] = Query(None),
+    action_type: Optional[str] = Query(None),
+    target_type: Optional[str] = Query(None),
     offset: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=100),
     session: Session = Depends(get_session),

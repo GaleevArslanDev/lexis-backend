@@ -103,7 +103,7 @@ def log_login_attempt(username: str, success: bool):
     else:
         security_logger.warning(f"Failed login attempt for user: {username}")
 
-def log_refresh_attempt(user_id: int | None, success: bool):
+def log_refresh_attempt(user_id: Optional[int], success: bool):
     if success:
         security_logger.info(f"Refresh token used successfully for user_id={user_id}")
     else:

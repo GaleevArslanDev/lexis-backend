@@ -1,9 +1,11 @@
 from datetime import datetime
+from typing import Optional
+
 from ..models import ActionLog
 from sqlmodel import Session, select, func
 
 
-def log_action(session: Session, user_id: int, action_type: str, target_type: str, target_id: int, details: str | None = None):
+def log_action(session: Session, user_id: int, action_type: str, target_type: str, target_id: int, details: Optional[str] = None):
     log = ActionLog(
         user_id=user_id,
         action_type=action_type,
@@ -71,10 +73,10 @@ def get_all_logs(
 def get_logs_for_user_with_count(
         session: Session,
         user_id: int,
-        from_date: datetime | None = None,
-        to_date: datetime | None = None,
-        action_type: str | None = None,
-        target_type: str | None = None,
+        from_date: Optional[datetime] = None,
+        to_date: Optional[datetime] = None,
+        action_type: Optional[str] = None,
+        target_type: Optional[str] = None,
         offset: int = 0,
         limit: int = 50
 ):
