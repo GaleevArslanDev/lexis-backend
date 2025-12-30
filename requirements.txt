@@ -5,6 +5,12 @@ sqlmodel
 python-jose[cryptography]
 passlib[bcrypt]
 pydantic
+pydantic-settings
+python-multipart
+alembic
+email-validator
+bcrypt
+aiofiles
 
 # БАЗА ДАННЫХ
 psycopg2-binary
