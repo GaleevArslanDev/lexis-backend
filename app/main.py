@@ -1,7 +1,6 @@
 from fastapi import FastAPI
 from .routers import auth, classes, assignments, files, ai, schools, reports, logs, users, assessit
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
 import gc
 import os
 
@@ -20,7 +19,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.add_middleware(GZipMiddleware, minimum_size=1000)
 gc.collect()
 
 # Подключаем все роутеры
