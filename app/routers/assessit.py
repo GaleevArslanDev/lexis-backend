@@ -51,7 +51,7 @@ router = APIRouter(prefix="/assessit", tags=["assessit"])
 logger = logging.getLogger(__name__)
 
 # Инициализация обработчиков
-ocr_engine = OCREngine(language=os.getenv("OCR_LANGUAGE", "rus+eng"))
+ocr_engine = OCREngine(lang=os.getenv("OCR_LANGUAGE", "ru"))
 solution_analyzer = SolutionAnalyzer()
 confidence_scorer = ConfidenceScorer()
 sympy_evaluator = SymPyEvaluator()
