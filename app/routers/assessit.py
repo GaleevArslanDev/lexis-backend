@@ -28,7 +28,7 @@ from ..crud.assessment import (
     get_class_assessment_summary,
     get_teacher_dashboard_stats, get_assessment_result, update_image_status, create_recognized_solution
 )
-from ..processing import OCREngine, ImagePreprocessor, SolutionAnalyzer, ConfidenceScorer, SymPyEvaluator
+from ..processing import LightweightOCREngine, ImagePreprocessor, SolutionAnalyzer, ConfidenceScorer, SymPyEvaluator
 from ..processing.ocr_engine import get_ocr_engine
 from ..schemas import (
     UploadWorkResponse,
@@ -53,7 +53,7 @@ router = APIRouter(prefix="/assessit", tags=["assessit"])
 logger = logging.getLogger(__name__)
 
 # Инициализация обработчиков
-ocr_engine = OCREngine(lang=os.getenv("OCR_LANGUAGE", "ru"))
+ocr_engine = LightweightOCREngine(lang=os.getenv("OCR_LANGUAGE", "ru"))
 solution_analyzer = SolutionAnalyzer()
 confidence_scorer = ConfidenceScorer()
 sympy_evaluator = SymPyEvaluator()
