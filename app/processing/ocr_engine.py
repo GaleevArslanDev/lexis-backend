@@ -2,54 +2,98 @@ import cv2
 import numpy as np
 from typing import Dict, List, Optional
 import logging
-from paddleocr import PaddleOCR
+import os
 
 logger = logging.getLogger(__name__)
 
 
-class OCREngine:
-    def __init__(self, lang: str = 'ru'):
-        # ЛЕНИВАЯ ИНИЦИАЛИЗАЦИЯ - модель загрузится только при первом вызове
-        self.lang = lang
-        self._ocr = None
-        self._model_loaded = False
+class LightweightOCREngine:
+    """Облегченный OCR движок для Render"""
 
-    def _ensure_loaded(self):
-        """Загружает модель только при необходимости"""
-        if not self._model_loaded:
-            logger.info("Loading PaddleOCR model (this may take a moment)...")
-            # Используем легкие модели для экономии памяти
-            self._ocr = PaddleOCR(
-                use_angle_cls=True,
-                lang=self.lang,
-                det_db_thresh=0.3,
-                det_db_box_thresh=0.5,
-                use_gpu=False,  # На Render нет GPU
-                enable_mkldnn=True,  # Ускорение CPU
-                use_tensorrt=False,
-                cls_model_dir='',  # Не использовать классификатор
-                show_log=False  # Отключить логи для экономии памяти
-            )
-            self._model_loaded = True
-            logger.info("PaddleOCR model loaded")
+    def __init__(self):
+        self._ocr = None
+        self._initialized = False
+
+    def _lazy_init(self):
+        """Ленивая инициализация PaddleOCR только при первом использовании"""
+        if not self._initialized:
+            try:
+                # Импортируем только при необходимости
+                from paddleocr import PaddleOCR
+
+                # Минимальная конфигурация для экономии памяти
+                self._ocr = PaddleOCR(
+                    use_angle_cls=False,  # Отключаем классификатор угла
+                    lang='ru',  # Только русский
+                    det_db_thresh=0.3,
+                    det_db_box_thresh=0.5,
+                    use_gpu=False,
+                    show_log=False,
+                    enable_mkldnn=True,  # Ускорение на CPU
+                    use_tensorrt=False,
+                    drop_score=0.5,
+                    # Отключаем ненужные компоненты
+                    cls_model_dir='',
+                    rec_model_dir='',
+                    det_model_dir=''
+                )
+                self._initialized = True
+                logger.info("PaddleOCR initialized in lightweight mode")
+
+                # Принудительный сбор мусора
+                import gc
+                gc.collect()
+
+            except Exception as e:
+                logger.error(f"Failed to initialize PaddleOCR: {str(e)}")
+                self._ocr = None
 
     def process_from_bytes(self, image_bytes: bytes) -> Dict:
-        """Обработка изображения из байтов"""
+        """Обработка изображения из байтов с минимальным использованием памяти"""
         try:
-            # Конвертируем байты в изображение
+            self._lazy_init()
+
+            if self._ocr is None:
+                return {
+                    "success": False,
+                    "error": "OCR engine not available",
+                    "full_text": "",
+                    "average_confidence": 0.0
+                }
+
+            # Конвертируем байты в numpy array без промежуточных файлов
             nparr = np.frombuffer(image_bytes, np.uint8)
-            image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-            if image is None:
-                return {"error": "Failed to decode image"}
+            if img is None:
+                return {
+                    "success": False,
+                    "error": "Failed to decode image",
+                    "full_text": "",
+                    "average_confidence": 0.0
+                }
 
-            # Обеспечиваем загрузку модели
-            self._ensure_loaded()
+            # Уменьшаем размер изображения если оно слишком большое
+            height, width = img.shape[:2]
+            if height > 2000 or width > 2000:
+                scale = 2000 / max(height, width)
+                new_width = int(width * scale)
+                new_height = int(height * scale)
+                img = cv2.resize(img, (new_width, new_height))
 
-            # Выполняем OCR
-            result = self._ocr.ocr(image, cls=False)
+            # Конвертируем в grayscale для экономии памяти
+            if len(img.shape) == 3:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = img
 
-            # Извлекаем текст и координаты
+            # Улучшаем контраст
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(gray)
+
+            # Обрабатываем только одну страницу
+            result = self._ocr.ocr(enhanced, cls=False)
+
             full_text = ""
             confidences = []
 
@@ -63,79 +107,43 @@ class OCREngine:
 
             avg_confidence = sum(confidences) / len(confidences) * 100 if confidences else 50.0
 
+            # Очищаем память
+            del img, gray, enhanced, result
+            import gc
+            gc.collect()
+
             return {
                 "success": True,
                 "full_text": full_text.strip(),
                 "average_confidence": avg_confidence,
                 "character_count": len(full_text),
-                "word_count": len(full_text.split()),
-                "formulas": self._extract_formulas(full_text),
-                "answer_candidates": self._extract_answers(full_text),
-                "raw_result": result
+                "word_count": len(full_text.split())
             }
 
         except Exception as e:
-            logger.error(f"Error in PaddleOCR: {str(e)}")
-            return {"success": False, "error": str(e)}
+            logger.error(f"Error in OCR processing: {str(e)}")
+            return {
+                "success": False,
+                "error": str(e),
+                "full_text": "",
+                "average_confidence": 0.0
+            }
 
-    def _extract_formulas(self, text: str) -> List[Dict]:
-        """Извлечение формул (упрощенное)"""
-        formulas = []
-        # Паттерны для математических выражений
-        import re
-        math_patterns = [
-            r'[a-zA-Zα-ωΑ-Ω]\s*[=≡≈]\s*[^=\n]+',
-            r'\d+\s*[+\-*/^]\s*\d+',
-            r'[Ss]\s*=\s*[^=\n]+',
-            r'[Vv]\s*=\s*[^=\n]+'
-        ]
-
-        for pattern in math_patterns:
-            matches = re.finditer(pattern, text)
-            for match in matches:
-                formula = match.group(0).strip()
-                formulas.append({
-                    'latex': formula,
-                    'confidence': 0.7,
-                    'original_text': formula
-                })
-
-        return formulas
-
-    def _extract_answers(self, text: str) -> List[Dict]:
-        """Извлечение ответов"""
-        import re
-        candidates = []
-
-        patterns = [
-            r'Ответ\s*[:=]\s*([0-9.,]+)',
-            r'[Aa]nswer\s*[:=]\s*([0-9.,]+)',
-            r'=\s*([0-9.,]+)\s*$',
-            r'получим\s*([0-9.,]+)',
-            r'равно\s*([0-9.,]+)'
-        ]
-
-        for pattern in patterns:
-            matches = re.finditer(pattern, text, re.IGNORECASE)
-            for match in matches:
-                if match.lastindex:
-                    answer = match.group(1).strip()
-                    candidates.append({
-                        'text': answer,
-                        'pattern': pattern,
-                        'context': match.group(0)
-                    })
-
-        return candidates
+    def cleanup(self):
+        """Очистка памяти"""
+        self._ocr = None
+        self._initialized = False
+        import gc
+        gc.collect()
 
 
-# Глобальный инстанс для reuse
+# Глобальный инстанс
 _OCR_ENGINE = None
 
 
 def get_ocr_engine():
-    """Ленивый геттер для OCR движка"""
+    """Получить или создать OCR движок"""
     global _OCR_ENGINE
     if _OCR_ENGINE is None:
-        _OCR_ENGINE = OCREngine(lang='ru')
+        _OCR_ENGINE = LightweightOCREngine()
     return _OCR_ENGINE

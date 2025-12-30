@@ -12,6 +12,7 @@ import uuid
 from datetime import datetime
 import logging
 import cv2
+import gc
 import numpy as np
 
 from ..db import get_session
@@ -28,6 +29,7 @@ from ..crud.assessment import (
     get_teacher_dashboard_stats, get_assessment_result, update_image_status, create_recognized_solution
 )
 from ..processing import OCREngine, ImagePreprocessor, SolutionAnalyzer, ConfidenceScorer, SymPyEvaluator
+from ..processing.ocr_engine import get_ocr_engine
 from ..schemas import (
     UploadWorkResponse,
     ProcessedWorkResponse,
@@ -42,7 +44,7 @@ from ..schemas import (
 )
 
 try:
-    resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 * 1024, 512 * 1024 * 1024))
+    resource.setrlimit(resource.RLIMIT_AS, (400 * 1024 * 1024, 400 * 1024 * 1024))
 except:
     pass
 
@@ -185,74 +187,67 @@ def process_image_sync(image_id: int, file_bytes: bytes, session: Session) -> di
         update_image_status(session, image_id, "error", str(e))
         return {"success": False, "error": str(e)}
 
+
 @router.post("/upload-work")
 async def upload_student_work(
         assignment_id: int,
         class_id: Optional[int] = None,
-        student_id: Optional[int] = None,
-        question_id: Optional[int] = None,
         file: UploadFile = File(...),
         session: Session = Depends(get_session),
         current_user: User = Depends(get_current_user)
 ):
-    """Загрузить работу студента"""
-    # Проверяем файл
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No filename provided")
-
-    # Читаем содержимое файла
-    file_content = await file.read()
-    file_size = len(file_content)
-
-    # Проверяем существование задания
-    assignment = session.get(Assignment, assignment_id)
-    if not assignment:
-        raise HTTPException(status_code=404, detail="Assignment not found")
-
-    # Если class_id не указан, берем из задания
-    if not class_id:
-        class_id = assignment.class_id
-
-    if student_id is None:
-        student_id = current_user.id
-
-    # Проверяем, состоит ли студент в классе
-    link = session.exec(
-        select(ClassStudentLink).where(
-            ClassStudentLink.class_id == class_id,
-            ClassStudentLink.student_id == student_id
-        )
-    ).first()
-
-    if not link:
-        raise HTTPException(status_code=403, detail="Student not in this class")
-
     try:
-        # Создаем запись в БД (без сохранения файла на диск)
+        # Читаем файл с ограничением размера (5MB максимум)
+        max_size = 5 * 1024 * 1024
+        file_content = await file.read(max_size)
+
+        # Создаем запись в БД
         image = create_assessment_image(
             session=session,
             assignment_id=assignment_id,
             student_id=current_user.id,
             file_name=file.filename,
-            file_size=file_size,
+            file_size=len(file_content),
             mime_type=file.content_type or "application/octet-stream",
-            class_id=class_id,
-            question_id=question_id
+            class_id=class_id
         )
 
-        # СИНХРОННАЯ обработка из байтов
-        process_result = process_image_sync(image.id, file_content, session)
+        # Простая обработка без тяжелых вычислений
+        ocr_result = get_ocr_engine().process_from_bytes(file_content)
 
-        if not process_result.get("success"):
-            logger.error(f"Processing failed for image {image.id}: {process_result.get('error')}")
+        if not ocr_result.get("success", False):
+            update_image_status(session, image.id, "error", ocr_result.get("error"))
+            return {
+                "work_id": image.id,
+                "message": "Work uploaded but OCR failed",
+                "error": ocr_result.get("error")
+            }
+
+        # Базовая обработка
+        solution_data = {
+            "image_id": image.id,
+            "extracted_text": ocr_result.get("full_text", ""),
+            "text_confidence": ocr_result.get("average_confidence", 50.0),
+            "total_confidence": ocr_result.get("average_confidence", 50.0) / 100.0,
+            "check_level": "level_1" if ocr_result.get("average_confidence", 0) > 70 else "level_3",
+            "auto_feedback": "Работа обработана" if ocr_result.get("success") else "Ошибка обработки",
+            "processing_time_ms": 0
+        }
+
+        create_recognized_solution(session, **solution_data)
+        update_image_status(session, image.id, "processed")
+
+        # Очистка памяти
+        del file_content
+        gc.collect()
 
         return UploadWorkResponse(
             work_id=image.id,
-            message="Work uploaded and processed successfully."
+            message="Work uploaded and processed successfully"
         )
 
     except Exception as e:
-        logger.error(f"Error uploading work: {str(e)}")
+        logger.error(f"Upload error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 @router.get("/work-status/{work_id}", response_model=ProcessedWorkResponse)
