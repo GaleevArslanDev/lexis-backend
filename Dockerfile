@@ -1,14 +1,12 @@
 FROM python:3.9-slim-bullseye
 
-# Установка системных зависимостей - ОПТИМИЗИРОВАННЫЙ НАБОР
+# Установка минимальных системных зависимостей
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
     libxrender1 \
-    libgomp1 \
-    libhdf5-dev \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -27,7 +25,7 @@ ENV PIP_NO_CACHE_DIR=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# Устанавливаем Python зависимости
+# Устанавливаем Python зависимости (удалены тяжелые OCR пакеты)
 RUN pip install --user --no-cache-dir --no-warn-script-location -r requirements.txt
 
 # Добавляем bin пользователя в PATH
@@ -40,8 +38,11 @@ COPY --chown=appuser:appuser . .
 ENV OMP_NUM_THREADS=1 \
     OPENBLAS_NUM_THREADS=1 \
     MKL_NUM_THREADS=1 \
-    PADDLE_PROCESSOR=cpu \
     TF_CPP_MIN_LOG_LEVEL=3
 
-# Запуск приложения с одним воркером для экономии памяти
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "10000", "--workers", "1"]
+# Добавляем переменные для OCR API
+ENV OCR_API_URL="" \
+    OCR_API_TOKEN=""
+
+# Запуск приложения
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

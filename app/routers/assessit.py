@@ -28,8 +28,10 @@ from ..crud.assessment import (
     get_class_assessment_summary,
     get_teacher_dashboard_stats, get_assessment_result, update_image_status, create_recognized_solution
 )
-from ..processing import LightweightOCREngine, ImagePreprocessor, SolutionAnalyzer, ConfidenceScorer, SymPyEvaluator
-from ..processing.ocr_engine import get_ocr_engine
+from ..ocr_client import get_ocr_client
+from ..processing.solution_analyzer import SolutionAnalyzer
+from ..processing.confidence_scorer import ConfidenceScorer
+from ..processing.sympy_evaluator import SymPyEvaluator
 from ..schemas import (
     UploadWorkResponse,
     ProcessedWorkResponse,
@@ -53,59 +55,14 @@ router = APIRouter(prefix="/assessit", tags=["assessit"])
 logger = logging.getLogger(__name__)
 
 # Инициализация обработчиков
-ocr_engine = LightweightOCREngine()
 solution_analyzer = SolutionAnalyzer()
 confidence_scorer = ConfidenceScorer()
 sympy_evaluator = SymPyEvaluator()
-
-def bytes_to_cv2_image(file_bytes: bytes) -> np.ndarray:
-    """Конвертировать байты в изображение OpenCV"""
-    try:
-        nparr = np.frombuffer(file_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img is None:
-            # Попробуем как grayscale
-            img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
-        return img
-    except Exception as e:
-        logger.error(f"Error converting bytes to image: {str(e)}")
-        raise
-
-
-def process_image_from_bytes(image_bytes: bytes) -> dict:
-    """Обработать изображение из байтов"""
-    try:
-        # Конвертируем байты в изображение OpenCV
-        image_cv2 = bytes_to_cv2_image(image_bytes)
-        if image_cv2 is None:
-            return {"success": False, "error": "Failed to decode image"}
-
-        # Сохраняем временный файл в памяти (для OCR)
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-            temp_path = tmp.name
-            cv2.imwrite(temp_path, image_cv2)
-
-        try:
-            # OCR распознавание
-            ocr_result = ocr_engine.process_complete_page(
-                temp_path,
-                extract_formulas=True,
-                extract_answers=True
-            )
-        finally:
-            # Удаляем временный файл
-            os.unlink(temp_path)
-
-        return {"success": True, "ocr_result": ocr_result, "image_shape": image_cv2.shape}
-
-    except Exception as e:
-        logger.error(f"Error processing image from bytes: {str(e)}")
-        return {"success": False, "error": str(e)}
+ocr_client = get_ocr_client()
 
 
 def process_image_sync(image_id: int, file_bytes: bytes, session: Session) -> dict:
-    """Упрощенная обработка изображения"""
+    """Упрощенная обработка изображения с использованием внешнего OCR API"""
     try:
         start_time = time.time()
 
@@ -113,21 +70,18 @@ def process_image_sync(image_id: int, file_bytes: bytes, session: Session) -> di
         if not image:
             return {"success": False, "error": "Image not found"}
 
-        # Используем наш OCR движок
-        ocr_result = ocr_engine.process_from_bytes(file_bytes)
+        # Используем OCR API вместо локального OCR
+        ocr_result = ocr_client.process_image_bytes(file_bytes)
 
         if not ocr_result.get("success", False):
-            error_msg = f"OCR error: {ocr_result.get('error', 'Unknown')}"
+            error_msg = f"OCR API error: {ocr_result.get('error', 'Unknown')}"
             update_image_status(session, image_id, "error", error_msg)
             return {"success": False, "error": error_msg}
 
         full_text = ocr_result.get("full_text", "")
         avg_confidence = ocr_result.get("average_confidence", 50.0)
 
-        # Логируем для отладки
-        logger.info(f"OCR text for {image_id}: {full_text[:100]}...")
-
-        # Упрощенный анализ
+        # Остальная логика остается прежней...
         text_length = len(full_text)
         has_numbers = any(c.isdigit() for c in full_text)
         has_equals = '=' in full_text
@@ -212,8 +166,8 @@ async def upload_student_work(
             class_id=class_id
         )
 
-        # Простая обработка без тяжелых вычислений
-        ocr_result = get_ocr_engine().process_from_bytes(file_content)
+        # Используем OCR API
+        ocr_result = ocr_client.process_image_bytes(file_content, filename=file.filename)
 
         if not ocr_result.get("success", False):
             update_image_status(session, image.id, "error", ocr_result.get("error"))
@@ -360,6 +314,7 @@ async def get_work_details(
         processing_time_ms=solution.processing_time_ms or 0,
         processed_at=solution.recognized_at
     )
+
 
 @router.post("/verify/{work_id}", response_model=TeacherVerificationResponse)
 async def verify_work(
@@ -701,3 +656,29 @@ async def get_common_errors(
         ))
 
     return errors
+
+
+@router.get("/health/ocr")
+async def check_ocr_health(
+        session: Session = Depends(get_session),
+        current_user: User = Depends(get_current_user)
+):
+    """Проверить состояние OCR API"""
+    try:
+        ocr_client = get_ocr_client()
+
+        # Проверяем доступность API
+        is_healthy = ocr_client.health_check()
+        languages = ocr_client.get_languages()
+
+        return {
+            "ocr_api_available": is_healthy,
+            "supported_languages": languages,
+            "ocr_api_url": os.getenv("OCR_API_URL", "not set")
+        }
+    except Exception as e:
+        logger.error(f"Error checking OCR health: {str(e)}")
+        return {
+            "ocr_api_available": False,
+            "error": str(e)
+        }

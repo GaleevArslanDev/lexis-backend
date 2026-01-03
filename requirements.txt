@@ -15,13 +15,12 @@ aiofiles
 # БАЗА ДАННЫХ
 psycopg2-binary
 sqlalchemy
-
-# OCR и обработка изображений
-paddlepaddle
-paddleocr
 opencv-python-headless
 Pillow
 numpy
 
 # Математический анализ
 sympy
+
+# Celery для фоновых задач (если используете)
+celery

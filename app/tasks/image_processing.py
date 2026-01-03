@@ -1,3 +1,4 @@
+# Обновляем импорты
 import os
 import time
 import logging
@@ -5,39 +6,42 @@ from typing import Dict, Any
 from sqlmodel import Session, select
 from app.db import engine
 import json
-from app.crud.assessment import (
-    update_image_status,
-    create_recognized_solution,
-    update_system_metrics
-)
-from app.processing import (
-    ImagePreprocessor,
-    OCREngine,
-    SolutionAnalyzer,
-    ConfidenceScorer,
-    SymPyEvaluator
-)
+
+# Добавляем импорт OCR клиента
+from app.ocr_client import get_ocr_client
+from app.processing.solution_analyzer import SolutionAnalyzer
+from app.processing.confidence_scorer import ConfidenceScorer
+from app.processing.sympy_evaluator import SymPyEvaluator
+
 from .celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 
 # Инициализация обработчиков
-image_preprocessor = ImagePreprocessor()
-ocr_engine = OCREngine(language=os.getenv("OCR_LANGUAGE", "rus+eng"))
 solution_analyzer = SolutionAnalyzer()
 confidence_scorer = ConfidenceScorer()
 sympy_evaluator = SymPyEvaluator()
 
+# Получаем OCR клиент
+ocr_client = get_ocr_client()
+
 
 @celery_app.task(bind=True, name="process_assessment_image")
-def process_assessment_image(self, image_id: int) -> Dict[str, Any]:
-    """Фоновая задача для обработки изображения с работой"""
+def process_assessment_image(self, image_id: int, image_bytes: bytes = None) -> Dict[str, Any]:
+    """Фоновая задача для обработки изображения с работой с использованием OCR API"""
     task_id = self.request.id
 
     try:
         start_time = time.time()
 
         with Session(engine) as session:
+            from app.models import AssessmentImage, Assignment, Question
+            from app.crud.assessment import (
+                update_image_status,
+                create_recognized_solution,
+                update_system_metrics
+            )
+
             # Обновляем статус на "processing"
             image = update_image_status(session, image_id, "processing")
             if not image:
@@ -45,42 +49,34 @@ def process_assessment_image(self, image_id: int) -> Dict[str, Any]:
 
             logger.info(f"Starting processing for image {image_id} (task: {task_id})")
 
-            # 1. Обработка изображения
-            processed_dir = os.getenv("PROCESSED_DIR", "/app/processed")
-            preprocessing_result = image_preprocessor.process_pipeline(
-                image.original_image_path,
-                processed_dir
-            )
+            # Если байты изображения не переданы, загружаем из файла
+            if image_bytes is None and image.original_image_path:
+                with open(image.original_image_path, 'rb') as f:
+                    image_bytes = f.read()
 
-            if not preprocessing_result.get("success", False):
-                error_msg = preprocessing_result.get("error", "Unknown preprocessing error")
+            if not image_bytes:
+                error_msg = "No image data available"
                 update_image_status(session, image_id, "error", error_msg)
                 return {"success": False, "error": error_msg}
 
-            # Обновляем пути к обработанным файлам
-            image.processed_image_path = preprocessing_result.get("processed_path")
-            image.thumbnail_path = preprocessing_result.get("thumbnail_path")
-            session.commit()
-
-            # 2. OCR распознавание
-            ocr_result = ocr_engine.process_complete_page(
-                image.original_image_path,
-                extract_formulas=True,
-                extract_answers=True
+            # 1. OCR распознавание через внешний API
+            ocr_result = ocr_client.process_image_bytes(
+                image_bytes,
+                filename=image.file_name,
+                extract_formulas=True
             )
 
-            if "error" in ocr_result:
-                error_msg = f"OCR error: {ocr_result['error']}"
+            if not ocr_result.get("success", False):
+                error_msg = f"OCR error: {ocr_result.get('error', 'Unknown')}"
                 update_image_status(session, image_id, "error", error_msg)
                 return {"success": False, "error": error_msg}
 
-            # 3. Анализ решения
+            # 2. Анализ решения
             structure_analysis = solution_analyzer.analyze_solution_structure(
                 ocr_result.get("full_text", "")
             )
 
-            # 4. Получаем данные задания для сравнения
-            from app.models import Assignment, Question
+            # 3. Получаем данные задания для сравнения
             assignment = session.get(Assignment, image.assignment_id)
             reference_data = {}
 
@@ -97,14 +93,14 @@ def process_assessment_image(self, image_id: int) -> Dict[str, Any]:
                     if not reference_data.get("reference_answer"):
                         reference_data["reference_answer"] = question.correct_answer
 
-            # 5. Сравнение с эталоном
+            # 4. Сравнение с эталоном
             comparison_result = solution_analyzer.compare_with_reference(
                 ocr_result.get("full_text", ""),
                 reference_data.get("reference_solution"),
                 reference_data.get("reference_answer")
             )
 
-            # 6. Расчет confidence scores
+            # 5. Расчет confidence scores
             confidence_data = confidence_scorer.calculate_total_confidence(
                 ocr_data={
                     'average_confidence': ocr_result.get('average_confidence', 50.0),
@@ -117,7 +113,7 @@ def process_assessment_image(self, image_id: int) -> Dict[str, Any]:
                 },
                 formula_data={
                     'formulas': ocr_result.get('formulas', []),
-                    'reference_formulas': None  # Можно добавить из эталона
+                    'reference_formulas': None
                 },
                 answer_data={
                     'extracted_answer': structure_analysis.get('extracted_answer'),
@@ -126,7 +122,7 @@ def process_assessment_image(self, image_id: int) -> Dict[str, Any]:
                 }
             )
 
-            # 7. Создаем запись распознанного решения
+            # 6. Создаем запись распознанного решения
             solution_data = {
                 "image_id": image_id,
                 "extracted_text": ocr_result.get("full_text", ""),
@@ -158,10 +154,10 @@ def process_assessment_image(self, image_id: int) -> Dict[str, Any]:
 
             recognized_solution = create_recognized_solution(session, **solution_data)
 
-            # 8. Обновляем статус изображения
+            # 7. Обновляем статус изображения
             update_image_status(session, image_id, "processed")
 
-            # 9. Обновляем метрики системы
+            # 8. Обновляем метрики системы
             update_system_metrics(
                 session,
                 total_processed=1,
@@ -189,9 +185,8 @@ def process_assessment_image(self, image_id: int) -> Dict[str, Any]:
         # Обновляем статус в случае ошибки
         try:
             with Session(engine) as session:
+                from app.crud.assessment import update_image_status, update_system_metrics
                 update_image_status(session, image_id, "error", str(e))
-
-                # Обновляем метрики ошибок
                 update_system_metrics(session, error_count=1)
         except:
             pass
@@ -200,81 +195,4 @@ def process_assessment_image(self, image_id: int) -> Dict[str, Any]:
             "success": False,
             "error": str(e),
             "image_id": image_id
-        }
-
-
-@celery_app.task(bind=True, name="batch_process_images")
-def batch_process_images(self, image_ids: list) -> Dict[str, Any]:
-    """Пакетная обработка нескольких изображений"""
-    results = {
-        "total": len(image_ids),
-        "successful": 0,
-        "failed": 0,
-        "results": [],
-        "total_time": 0
-    }
-
-    start_time = time.time()
-
-    for image_id in image_ids:
-        try:
-            result = process_assessment_image.delay(image_id).get(timeout=300)
-            results["results"].append(result)
-
-            if result.get("success"):
-                results["successful"] += 1
-            else:
-                results["failed"] += 1
-
-        except Exception as e:
-            logger.error(f"Error in batch processing for image {image_id}: {str(e)}")
-            results["failed"] += 1
-            results["results"].append({
-                "image_id": image_id,
-                "success": False,
-                "error": str(e)
-            })
-
-    results["total_time"] = int((time.time() - start_time) * 1000)
-
-    return results
-
-
-import json  # Добавляем импорт для json
-
-
-@celery_app.task(name="retry_failed_images")
-def retry_failed_images(max_retries: int = 3) -> Dict[str, Any]:
-    """Повторная обработка неудачных задач"""
-    with Session(engine) as session:
-        from app.models import AssessmentImage
-
-        # Ищем изображения со статусом error и retry_count < max_retries
-        statement = select(AssessmentImage).where(
-            AssessmentImage.status == "error",
-            AssessmentImage.retry_count < max_retries
-        )
-
-        failed_images = session.exec(statement).all()
-
-        results = []
-        for image in failed_images:
-            try:
-                # Запускаем повторную обработку
-                result = process_assessment_image.delay(image.id).get(timeout=300)
-                results.append({
-                    "image_id": image.id,
-                    "success": result.get("success", False)
-                })
-            except Exception as e:
-                logger.error(f"Retry failed for image {image.id}: {str(e)}")
-                results.append({
-                    "image_id": image.id,
-                    "success": False,
-                    "error": str(e)
-                })
-
-        return {
-            "total_retried": len(failed_images),
-            "results": results
         }
