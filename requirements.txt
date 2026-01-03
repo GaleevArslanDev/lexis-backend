@@ -16,9 +16,6 @@ requests
 # БАЗА ДАННЫХ
 psycopg2-binary
 sqlalchemy
-opencv-python-headless
-Pillow
-numpy
 
 # Математический анализ
 sympy

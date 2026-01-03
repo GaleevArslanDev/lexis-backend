@@ -1,33 +1,63 @@
 from sqlmodel import SQLModel, create_engine, Session
-from sqlalchemy.pool import NullPool
 import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import logging
+
+logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-# Для Render с ограниченной памятью используем более легкие настройки
+# УПРОЩАЕМ НАСТРОЙКИ ДЛЯ ЭКОНОМИИ ПАМЯТИ
 engine = create_engine(
     DATABASE_URL,
-    poolclass=NullPool,  # Не используем пул соединений для экономии памяти
-    echo=False,  # Отключаем логирование SQL
-    pool_pre_ping=False,  # Отключаем проверку соединений
+    # Используем NullPool для минимизации использования памяти
+    poolclass=None,  # SQLAlchemy по умолчанию использует QueuePool, но мы можем отключить пул
+    echo=False,
+    # Упрощаем параметры соединения
     connect_args={
-        "sslmode": "require",
-        "connect_timeout": 10,
-        "application_name": "lexis-backend",
+        "connect_timeout": 5,
         "keepalives": 1,
         "keepalives_idle": 30,
-        "keepalives_interval": 5,
-        "keepalives_count": 5
+        "keepalives_interval": 10,
+        "keepalives_count": 3,
+        "application_name": "lexis-backend"
     }
 )
 
+
+# Отключаем SSL проверку для экономии памяти (не для продакшена!)
+# Для тестирования можно временно отключить SSL
 def get_session():
     """Генератор сессий с обработкой исключений"""
     try:
-        with Session(engine) as session:
+        # Создаем соединение без SSL принудительно
+        connection = psycopg2.connect(
+            DATABASE_URL,
+            connect_timeout=5,
+            sslmode='disable'  # Отключаем SSL для тестирования
+        )
+
+        session = Session(bind=connection)
+        try:
             yield session
+        finally:
+            session.close()
+            connection.close()
+
     except Exception as e:
-        print(f"Database session error: {e}")
-        # Повторная попытка с новой сессией
-        with Session(engine) as session:
+        logger.error(f"Database session error: {e}")
+        # Попробуем снова с еще более простыми настройками
+        try:
+            connection = psycopg2.connect(
+                DATABASE_URL,
+                connect_timeout=3,
+                sslmode='disable'
+            )
+            session = Session(bind=connection)
             yield session
+            session.close()
+            connection.close()
+        except Exception as e2:
+            logger.error(f"Retry failed: {e2}")
+            raise HTTPException(status_code=500, detail="Database connection failed")
