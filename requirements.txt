@@ -11,6 +11,7 @@ alembic
 email-validator
 bcrypt
 aiofiles
+requests
 
 # БАЗА ДАННЫХ
 psycopg2-binary
