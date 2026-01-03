@@ -11,9 +11,7 @@ import os
 import uuid
 from datetime import datetime
 import logging
-import cv2
 import gc
-import numpy as np
 
 from ..db import get_session
 from ..dependencies.auth import get_current_user
