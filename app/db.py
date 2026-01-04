@@ -10,16 +10,20 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 engine = create_engine(
     DATABASE_URL,
     echo=False,
-    pool_pre_ping=True,  # Проверять соединение перед использованием
-    pool_recycle=300,  # Пересоздавать соединения каждые 300 секунд
+    pool_pre_ping=True,
+    pool_recycle=300,
 )
 
 
 def get_session():
     """Генератор сессий с обработкой исключений"""
+    session = None
     try:
-        with Session(engine) as session:
-            yield session
+        session = Session(engine)
+        yield session
     except Exception as e:
         logger.error(f"Database session error: {e}")
         raise HTTPException(status_code=500, detail="Database connection failed")
+    finally:
+        if session:
+            session.close()
