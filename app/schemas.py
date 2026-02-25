@@ -106,9 +106,12 @@ class UploadWorkRequest(BaseModel):
 
 class UploadWorkResponse(BaseModel):
     work_id: int
-    upload_url: Optional[str] = None
     message: str
-
+    error: Optional[str] = None
+    confidence_score: Optional[float] = None
+    check_level: Optional[str] = None
+    solution_id: Optional[str] = None  # UUID из ML API
+    
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -121,7 +124,20 @@ class ProcessedWorkResponse(BaseModel):
     extracted_answer: Optional[str] = None
     processing_time_ms: Optional[int] = None
     error_message: Optional[str] = None
+    solution_id: Optional[str] = None  # UUID из ML API
+    mark_score: Optional[float] = None  # Итоговая оценка
+    teacher_comment: Optional[str] = None  # Комментарий от LLM
+    
+    model_config = ConfigDict(from_attributes=True)
 
+
+class StepAnalysis(BaseModel):
+    step_id: int
+    is_correct: bool
+    formula_match: bool
+    found_formula: Optional[str] = None
+    expected_formula: Optional[str] = None
+    
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -158,9 +174,20 @@ class DetailedAnalysisResponse(BaseModel):
     total_confidence: float
 
     # Классификация
-    check_level: CheckLevel
+    check_level: str  # level_1, level_2, level_3
     suggested_grade: Optional[float]
     auto_feedback: str
+
+    # Детальный анализ шагов (новое)
+    steps_analysis: Optional[List[StepAnalysis]] = None
+    
+    # Детальные скоринг-метрики (новое)
+    c_ocr: Optional[float] = None
+    c_llm: Optional[float] = None
+    m_sympy: Optional[float] = None
+    m_llm: Optional[float] = None
+    m_answer: Optional[float] = None
+    mark_score: Optional[float] = None
 
     # Визуализация
     annotated_image_url: Optional[str] = None

@@ -6,6 +6,73 @@ from ..models import (
     TrainingSample, SystemMetrics, User, Class, Assignment
 )
 
+def create_recognized_solution_v1(
+        session: Session,
+        image_id: int,
+        assessment_data: Dict[str, Any]
+) -> RecognizedSolution:
+    """
+    Создать запись о распознанном решении из данных ML API v1
+    
+    Args:
+        session: Сессия БД
+        image_id: ID изображения
+        assessment_data: Данные из поля assessment ответа ML API
+    """
+    # Извлекаем данные
+    scores = assessment_data.get("scores", {})
+    steps = assessment_data.get("steps_analysis", [])
+    
+    # Конвертируем check_level из числа в строку
+    confidence_level = assessment_data.get("confidence_level", 3)
+    check_level_map = {
+        1: "level_1",
+        2: "level_2",
+        3: "level_3"
+    }
+    check_level = check_level_map.get(confidence_level, "level_3")
+    
+    solution = RecognizedSolution(
+        image_id=image_id,
+        extracted_text="",  # Будет заполнено позже, если нужно
+        text_confidence=scores.get("c_ocr", 0.0) * 100,  # Конвертируем в проценты
+        formulas_count=0,  # Можно извлечь из steps при необходимости
+        
+        # Confidence scores
+        ocr_confidence=scores.get("c_ocr", 0.0),
+        formula_confidence=scores.get("c_llm", 0.0),  # Используем c_llm как formula_confidence
+        answer_match_confidence=scores.get("m_answer", 0.0),
+        total_confidence=assessment_data.get("confidence_score", 0.0),
+        
+        # Классификация
+        check_level=check_level,
+        suggested_grade=assessment_data.get("mark_score", 0.0) * 5,  # Конвертируем в 5-балльную
+        auto_feedback=assessment_data.get("teacher_comment", ""),
+        
+        # Новые поля
+        solution_id=assessment_data.get("solution_id"),
+        mark_score=assessment_data.get("mark_score", 0.0),
+        teacher_comment=assessment_data.get("teacher_comment", ""),
+        
+        # Детальные скоринг-метрики
+        c_ocr=scores.get("c_ocr"),
+        c_llm=scores.get("c_llm"),
+        m_sympy=scores.get("m_sympy"),
+        m_llm=scores.get("m_llm"),
+        m_answer=scores.get("m_answer"),
+        
+        # Шаги анализа
+        steps_analysis_json=json.dumps(steps, ensure_ascii=False) if steps else None,
+        
+        processing_time_ms=assessment_data.get("execution_time", 0) * 1000,  # Конвертируем в мс
+        recognized_at=datetime.fromisoformat(assessment_data.get("created_at", datetime.utcnow().isoformat()))
+    )
+    
+    session.add(solution)
+    session.commit()
+    session.refresh(solution)
+    return solution
+
 
 def create_assessment_image(
         session: Session,

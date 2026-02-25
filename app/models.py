@@ -230,6 +230,24 @@ class RecognizedSolution(SQLModel, table=True):
     image: Optional[AssessmentImage] = Relationship(back_populates="recognized_solutions")
     assessment_results: List["AssessmentResult"] = Relationship(back_populates="recognized_solution")
 
+    solution_id: Optional[str] = Field(default=None, index=True)  # UUID из ML API
+    mark_score: Optional[float] = None  # Mtotal
+    teacher_comment: Optional[str] = None  # Комментарий от LLM
+    
+    # Детальные скоринг-метрики (дублируем для совместимости)
+    c_ocr: Optional[float] = None
+    c_llm: Optional[float] = None
+    m_sympy: Optional[float] = None
+    m_llm: Optional[float] = None
+    m_answer: Optional[float] = None
+    
+    # Анализ шагов
+    steps_analysis_json: Optional[str] = None  # JSON с анализом шагов
+    
+    # Метаданные
+    api_version: Optional[str] = Field(default="v1")
+    job_id: Optional[str] = None  # ID задачи в очереди (для асинхронной обработки)
+
     class Config:
         from_attributes = True
 

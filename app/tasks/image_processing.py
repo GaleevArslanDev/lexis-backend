@@ -6,6 +6,7 @@ from typing import Dict, Any
 from sqlmodel import Session, select
 from app.db import engine
 import json
+import re
 
 # Добавляем импорт OCR клиента
 from app.ocr_client import get_ocr_client
@@ -24,6 +25,27 @@ sympy_evaluator = SymPyEvaluator()
 
 # Получаем OCR клиент
 ocr_client = get_ocr_client()
+
+
+def extract_final_answer(text: str) -> str | None:
+    """
+    MVP-логика:
+    Ищем последнее число / выражение после '=', 'Ответ:', 'Ответ'
+    """
+    if not text:
+        return None
+
+    patterns = [
+        r"Ответ[:\s]*([-\d\.\,\/\*\+\(\)]+)",
+        r"=\s*([-\d\.\,\/\*\+\(\)]+)",
+    ]
+
+    for pattern in patterns:
+        matches = re.findall(pattern, text)
+        if matches:
+            return matches[-1].replace(",", ".").strip()
+
+    return None
 
 
 @celery_app.task(bind=True, name="process_assessment_image")
@@ -72,9 +94,7 @@ def process_assessment_image(self, image_id: int, image_bytes: bytes = None) -> 
                 return {"success": False, "error": error_msg}
 
             # 2. Анализ решения
-            structure_analysis = solution_analyzer.analyze_solution_structure(
-                ocr_result.get("full_text", "")
-            )
+            extracted_answer = extract_final_answer(ocr_result.get("full_text", ""))
 
             # 3. Получаем данные задания для сравнения
             assignment = session.get(Assignment, image.assignment_id)
@@ -94,33 +114,33 @@ def process_assessment_image(self, image_id: int, image_bytes: bytes = None) -> 
                         reference_data["reference_answer"] = question.correct_answer
 
             # 4. Сравнение с эталоном
-            comparison_result = solution_analyzer.compare_with_reference(
-                ocr_result.get("full_text", ""),
-                reference_data.get("reference_solution"),
-                reference_data.get("reference_answer")
-            )
+            comparison_result = None
+            answer_match_score = 0.0
+
+            if extracted_answer and reference_data.get("reference_answer"):
+                try:
+                    is_equal = sympy_evaluator.compare_answers(
+                        extracted_answer,
+                        reference_data["reference_answer"]
+                    )
+                    answer_match_score = 1.0 if is_equal else 0.0
+                except Exception:
+                    answer_match_score = 0.0
 
             # 5. Расчет confidence scores
-            confidence_data = confidence_scorer.calculate_total_confidence(
-                ocr_data={
-                    'average_confidence': ocr_result.get('average_confidence', 50.0),
-                    'character_count': ocr_result.get('character_count', 0),
-                    'quality_assessment': ocr_result.get('quality_assessment', {})
-                },
-                solution_structure={
-                    'calculation_chains': structure_analysis.get('calculation_chains', []),
-                    'has_formulas': len(ocr_result.get('formulas', [])) > 0
-                },
-                formula_data={
-                    'formulas': ocr_result.get('formulas', []),
-                    'reference_formulas': None
-                },
-                answer_data={
-                    'extracted_answer': structure_analysis.get('extracted_answer'),
-                    'reference_answer': reference_data.get('reference_answer'),
-                    'calculation_result': comparison_result.get('final_result') if comparison_result else None
+            total_confidence = 0.95 if answer_match_score == 1.0 else 0.3
+
+            confidence_data = {
+                "total_confidence": total_confidence,
+                "check_level": "auto_ok" if answer_match_score == 1.0 else "needs_review",
+                "suggested_grade": 5 if answer_match_score == 1.0 else 2,
+                "auto_feedback": "Ответ совпадает с эталоном" if answer_match_score == 1.0 else "Ответ не совпадает",
+                "needs_attention": answer_match_score == 0.0,
+                "attention_reasons": [] if answer_match_score == 1.0 else ["answer_mismatch"],
+                "component_scores": {
+                    "answer_match_confidence": answer_match_score
                 }
-            )
+            }
 
             # 6. Создаем запись распознанного решения
             solution_data = {
@@ -128,8 +148,8 @@ def process_assessment_image(self, image_id: int, image_bytes: bytes = None) -> 
                 "extracted_text": ocr_result.get("full_text", ""),
                 "text_confidence": ocr_result.get("average_confidence", 0.0),
                 "formulas_count": len(ocr_result.get("formulas", [])),
-                "extracted_answer": structure_analysis.get('extracted_answer'),
-                "answer_confidence": comparison_result.get('comparison_score', 0.0) if comparison_result else None,
+                "extracted_answer": extracted_answer,
+                "answer_confidence": answer_match_score,
                 "ocr_confidence": confidence_data['component_scores'].get('ocr_confidence'),
                 "solution_structure_confidence": confidence_data['component_scores'].get(
                     'solution_structure_confidence'),
@@ -146,11 +166,6 @@ def process_assessment_image(self, image_id: int, image_bytes: bytes = None) -> 
             if ocr_result.get("formulas"):
                 solution_data["extracted_formulas_json"] = json.dumps(ocr_result.get("formulas", []),
                                                                       ensure_ascii=False)
-
-            # Добавляем шаги решения если есть
-            if structure_analysis.get('steps'):
-                solution_data["solution_steps_json"] = json.dumps(structure_analysis.get('steps', []),
-                                                                  ensure_ascii=False)
 
             recognized_solution = create_recognized_solution(session, **solution_data)
 

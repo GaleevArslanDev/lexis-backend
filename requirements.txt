@@ -17,8 +17,5 @@ requests==2.31.0
 psycopg2-binary==2.9.9
 sqlalchemy==2.0.23
 
-# Математический анализ
-sympy==1.12
-
 # Celery для фоновых задач
 celery==5.3.4

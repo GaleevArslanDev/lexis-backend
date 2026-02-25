@@ -1,231 +1,178 @@
+"""
+Клиент для взаимодействия с внешним OCR API (версия v1)
+"""
 import requests
-import base64
 from typing import Dict, Any, Optional, List
 import logging
-from io import BytesIO
-import tempfile
-import os
+from datetime import datetime
+import uuid
 
 logger = logging.getLogger(__name__)
 
 
-class OCRAPIClient:
+class OCRAPIClientV1:
+    """Клиент для API v1 с эндпоинтом /ocr/assess"""
+
     def __init__(self, base_url: str, api_token: str):
         self.base_url = base_url.rstrip('/')
         self.api_token = api_token
         self.headers = {"Authorization": f"Bearer {api_token}"}
 
-    def process_image_bytes(
+    def assess_solution(
             self,
             image_bytes: bytes,
             filename: str = "image.png",
-            language: str = "rus+eng",
-            extract_formulas: bool = True,
-            preprocess_level: str = "auto"
+            reference_answer: Optional[str] = None,
+            reference_formulas: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """
-        Отправляет изображение в OCR API и возвращает результат
+        Отправляет изображение на эндпоинт /api/v1/ocr/assess для полной проверки решения
+        
+        Args:
+            image_bytes: Байты изображения
+            filename: Имя файла
+            reference_answer: Эталонный ответ для сравнения
+            reference_formulas: Список эталонных формул через точку с запятой
+        
+        Returns:
+            Dict с результатами проверки
         """
         try:
-            files = {"file": (filename, image_bytes, "image/png")}
-            data = {
-                "language": language,
-                "preprocess_level": preprocess_level,
-                "extract_formulas": str(extract_formulas).lower()
-            }
+            files = {"file": (filename, image_bytes, self._get_mime_type(filename))}
+            data = {}
+
+            if reference_answer:
+                data["reference_answer"] = reference_answer
+
+            if reference_formulas:
+                data["reference_formulas"] = ";".join(reference_formulas)
 
             response = requests.post(
-                f"{self.base_url}/api/ocr",
+                f"{self.base_url}/api/v1/ocr/assess",
                 files=files,
                 data=data,
                 headers=self.headers,
-                timeout=60  # Увеличиваем таймаут для обработки
+                timeout=120  # Увеличиваем таймаут для полной обработки
             )
 
             if response.status_code != 200:
-                logger.error(f"OCR API error: {response.status_code} - {response.text}")
+                logger.error(f"OCR API v1 error: {response.status_code} - {response.text}")
                 return {
                     "success": False,
                     "error": f"OCR API returned {response.status_code}: {response.text}",
-                    "full_text": "",
-                    "average_confidence": 0.0
+                    "assessment": None
                 }
 
             result = response.json()
 
-            if result.get("status") != "success":
+            if not result.get("success", False):
                 return {
                     "success": False,
-                    "error": f"OCR API processing failed: {result.get('detail', 'Unknown error')}",
-                    "full_text": "",
-                    "average_confidence": 0.0
+                    "error": result.get("error", "Unknown error"),
+                    "assessment": None
                 }
-
-            # Преобразуем ответ OCR API в формат, совместимый с нашим приложением
-            ocr_data = self._format_ocr_result(result)
 
             return {
                 "success": True,
-                **ocr_data
+                "assessment": result.get("assessment"),
+                "error": None
             }
 
+        except requests.exceptions.Timeout:
+            logger.error("OCR API timeout")
+            return {
+                "success": False,
+                "error": "OCR API timeout after 120 seconds",
+                "assessment": None
+            }
         except requests.exceptions.RequestException as e:
             logger.error(f"Network error calling OCR API: {str(e)}")
             return {
                 "success": False,
                 "error": f"Network error: {str(e)}",
-                "full_text": "",
-                "average_confidence": 0.0
+                "assessment": None
             }
         except Exception as e:
             logger.error(f"Unexpected error in OCR processing: {str(e)}")
             return {
                 "success": False,
                 "error": str(e),
-                "full_text": "",
-                "average_confidence": 0.0
+                "assessment": None
             }
 
-    def _format_ocr_result(self, api_result: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Форматирует результат OCR API в формат, совместимый с нашим приложением
-        """
-        try:
-            results = api_result.get("results", {})
-            ocr_data = results.get("ocr_data", {})
-
-            # Получаем полный текст
-            full_text = ocr_data.get("full_text", "")
-
-            # Вычисляем среднюю уверенность
-            text_blocks = ocr_data.get("text_blocks", [])
-            if text_blocks:
-                confidences = [block.get("confidence", 0.0) for block in text_blocks]
-                avg_confidence = sum(confidences) / len(confidences) * 100
-            else:
-                avg_confidence = 0.0
-
-            # Извлекаем формулы
-            formulas = []
-            formatted_results = results.get("formatted_results", [])
-            for item in formatted_results:
-                if item.get("type") == "formula":
-                    formulas.append({
-                        "latex": item.get("content", ""),
-                        "confidence": item.get("metadata", {}).get("confidence", 0.8),
-                        "position": item.get("position", {}),
-                        "is_correct": None
-                    })
-
-            # Оценка качества
-            quality_assessment = results.get("summary", {}).get("quality_assessment", {})
-
-            return {
-                "full_text": full_text,
-                "average_confidence": avg_confidence,
-                "character_count": len(full_text),
-                "word_count": len(full_text.split()),
-                "formulas": formulas,
-                "quality_assessment": quality_assessment,
-                "formatted_results": formatted_results,
-                "text_blocks": text_blocks
-            }
-
-        except Exception as e:
-            logger.error(f"Error formatting OCR result: {str(e)}")
-            return {
-                "full_text": "",
-                "average_confidence": 0.0,
-                "character_count": 0,
-                "word_count": 0,
-                "formulas": [],
-                "quality_assessment": {},
-                "formatted_results": [],
-                "text_blocks": []
-            }
-
-    def batch_process(
-            self,
-            files: List[Dict[str, bytes]],
-            language: str = "rus+eng"
-    ) -> Dict[str, Any]:
-        """
-        Пакетная обработка нескольких файлов
-        """
-        try:
-            files_data = []
-            for i, file_data in enumerate(files):
-                filename = file_data.get("filename", f"image_{i}.png")
-                content = file_data.get("content")
-                files_data.append(("files", (filename, content, "image/png")))
-
-            data = {"language": language}
-
-            response = requests.post(
-                f"{self.base_url}/api/batch-ocr",
-                files=files_data,
-                data=data,
-                headers=self.headers,
-                timeout=120
-            )
-
-            if response.status_code != 200:
-                return {
-                    "success": False,
-                    "error": f"Batch OCR API error: {response.status_code}"
-                }
-
-            return response.json()
-
-        except Exception as e:
-            logger.error(f"Error in batch OCR processing: {str(e)}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
-
-    def health_check(self) -> bool:
-        """
-        Проверяет доступность OCR API
-        """
+    def health_check(self) -> Dict[str, Any]:
+        """Проверка состояния сервиса"""
         try:
             response = requests.get(
-                f"{self.base_url}/api/health",
-                headers=self.headers,
-                timeout=5
-            )
-            return response.status_code == 200
-        except:
-            return False
-
-    def get_languages(self) -> List[str]:
-        """
-        Получает список поддерживаемых языков
-        """
-        try:
-            response = requests.get(
-                f"{self.base_url}/api/languages",
+                f"{self.base_url}/api/v1/health",
                 headers=self.headers,
                 timeout=5
             )
             if response.status_code == 200:
-                return response.json().get("available_languages", [])
-            return ["rus+eng"]
-        except:
-            return ["rus+eng"]
+                return response.json()
+            return {"status": "unhealthy", "services": {}}
+        except Exception as e:
+            logger.error(f"Health check failed: {str(e)}")
+            return {"status": "unhealthy", "error": str(e)}
+
+    def get_queue_status(self) -> Dict[str, Any]:
+        """Получить статус очереди"""
+        try:
+            response = requests.get(
+                f"{self.base_url}/api/v1/ocr/queue/status",
+                headers=self.headers,
+                timeout=5
+            )
+            if response.status_code == 200:
+                return response.json()
+            return {}
+        except Exception as e:
+            logger.error(f"Queue status check failed: {str(e)}")
+            return {}
+
+    def get_job_status(self, job_id: str) -> Dict[str, Any]:
+        """Получить статус задачи по ID"""
+        try:
+            response = requests.get(
+                f"{self.base_url}/api/v1/ocr/queue/job/{job_id}",
+                headers=self.headers,
+                timeout=5
+            )
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 404:
+                return {"status": "not_found"}
+            return {"status": "error"}
+        except Exception as e:
+            logger.error(f"Job status check failed: {str(e)}")
+            return {"status": "error", "error": str(e)}
+
+    def _get_mime_type(self, filename: str) -> str:
+        """Определить MIME-тип по расширению файла"""
+        ext = filename.lower().split('.')[-1] if '.' in filename else ''
+        mime_types = {
+            'png': 'image/png',
+            'jpg': 'image/jpeg',
+            'jpeg': 'image/jpeg',
+            'gif': 'image/gif',
+            'bmp': 'image/bmp',
+            'tiff': 'image/tiff',
+            'webp': 'image/webp'
+        }
+        return mime_types.get(ext, 'application/octet-stream')
 
 
-# Глобальный инстанс клиента OCR
-_OCR_CLIENT = None
+# Глобальный инстанс клиента OCR v1
+_OCR_CLIENT_V1 = None
 
 
-def get_ocr_client() -> OCRAPIClient:
+def get_ocr_client_v1() -> OCRAPIClientV1:
     """
-    Получить или создать экземпляр OCR клиента
+    Получить или создать экземпляр OCR клиента v1
     """
-    global _OCR_CLIENT
+    global _OCR_CLIENT_V1
 
-    if _OCR_CLIENT is None:
+    if _OCR_CLIENT_V1 is None:
         import os
         ocr_api_url = os.getenv("OCR_API_URL", "https://galeevarslan2021-lexis-ocr.hf.space")
         ocr_api_token = os.getenv("OCR_API_TOKEN", "")
@@ -233,6 +180,6 @@ def get_ocr_client() -> OCRAPIClient:
         if not ocr_api_token:
             logger.warning("OCR_API_TOKEN not set. OCR will fail.")
 
-        _OCR_CLIENT = OCRAPIClient(ocr_api_url, ocr_api_token)
+        _OCR_CLIENT_V1 = OCRAPIClientV1(ocr_api_url, ocr_api_token)
 
-    return _OCR_CLIENT
+    return _OCR_CLIENT_V1

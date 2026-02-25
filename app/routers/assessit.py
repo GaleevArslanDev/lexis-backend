@@ -1,22 +1,19 @@
 import json
-import resource
-import sys
 import time
-import io
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse
-from sqlmodel import Session, select
-from typing import List, Optional
-import os
 import uuid
 from datetime import datetime
+from typing import List, Optional
 import logging
 import gc
+
+from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks, Query
+from fastapi.responses import JSONResponse
+from sqlmodel import Session, select
 
 from ..db import get_session
 from ..dependencies.auth import get_current_user
 from ..dependencies_util import require_role
-from ..models import User, AssessmentImage, Assignment, Class, ClassStudentLink
+from ..models import User, AssessmentImage, Assignment, Class, ClassStudentLink, RecognizedSolution
 from ..crud.assessment import (
     create_assessment_image,
     get_assessment_image,
@@ -24,12 +21,11 @@ from ..crud.assessment import (
     create_assessment_result,
     get_class_assessments,
     get_class_assessment_summary,
-    get_teacher_dashboard_stats, get_assessment_result, update_image_status, create_recognized_solution
+    get_teacher_dashboard_stats,
+    update_image_status,
+    create_recognized_solution_v1,  # Новый метод
 )
-from ..ocr_client import get_ocr_client
-from ..processing.solution_analyzer import SolutionAnalyzer
-from ..processing.confidence_scorer import ConfidenceScorer
-from ..processing.sympy_evaluator import SymPyEvaluator
+from ..ocr_client import get_ocr_client_v1  # Новый клиент
 from ..schemas import (
     UploadWorkResponse,
     ProcessedWorkResponse,
@@ -43,151 +39,110 @@ from ..schemas import (
     CommonError
 )
 
-try:
-    resource.setrlimit(resource.RLIMIT_AS, (400 * 1024 * 1024, 400 * 1024 * 1024))
-except:
-    pass
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/assessit", tags=["assessit"])
 
-logger = logging.getLogger(__name__)
-
-# Инициализация обработчиков
-solution_analyzer = SolutionAnalyzer()
-confidence_scorer = ConfidenceScorer()
-sympy_evaluator = SymPyEvaluator()
-ocr_client = get_ocr_client()
+# Инициализация клиента v1
+ocr_client_v1 = get_ocr_client_v1()
 
 
-def process_image_sync(image_id: int, file_bytes: bytes, session: Session) -> dict:
-    """Упрощенная обработка изображения с использованием внешнего OCR API"""
-    try:
-        start_time = time.time()
-
-        image = update_image_status(session, image_id, "processing")
-        if not image:
-            return {"success": False, "error": "Image not found"}
-
-        # Используем OCR API вместо локального OCR
-        ocr_result = ocr_client.process_image_bytes(file_bytes)
-
-        if not ocr_result.get("success", False):
-            error_msg = f"OCR API error: {ocr_result.get('error', 'Unknown')}"
-            update_image_status(session, image_id, "error", error_msg)
-            return {"success": False, "error": error_msg}
-
-        full_text = ocr_result.get("full_text", "")
-        avg_confidence = ocr_result.get("average_confidence", 50.0)
-
-        # Остальная логика остается прежней...
-        text_length = len(full_text)
-        has_numbers = any(c.isdigit() for c in full_text)
-        has_equals = '=' in full_text
-        has_answer = any(word in full_text.lower() for word in ['ответ', 'answer'])
-
-        # Простой расчет confidence
-        length_factor = min(text_length / 100.0, 1.0)
-        content_factor = 0.3 if has_numbers else 0.1
-        answer_factor = 0.3 if has_answer else 0.1
-
-        total_confidence = (
-                (avg_confidence / 100.0) * 0.4 +
-                length_factor * 0.3 +
-                content_factor * 0.2 +
-                answer_factor * 0.1
-        )
-
-        # Определяем уровень
-        if total_confidence >= 0.6:
-            check_level = "level_1"
-            auto_feedback = "✅ Можно проверить автоматически"
-        elif total_confidence >= 0.3:
-            check_level = "level_2"
-            auto_feedback = "⚠️ Требует внимания"
-        else:
-            check_level = "level_3"
-            auto_feedback = "❌ Ручная проверка"
-
-        # Создаем решение
-        solution_data = {
-            "image_id": image_id,
-            "extracted_text": full_text,
-            "text_confidence": avg_confidence,
-            "formulas_count": len(ocr_result.get("formulas", [])),
-            "ocr_confidence": avg_confidence / 100.0,
-            "solution_structure_confidence": 0.5 if has_equals else 0.2,
-            "answer_match_confidence": 0.5 if has_answer else 0.2,
-            "total_confidence": total_confidence,
-            "check_level": check_level,
-            "auto_feedback": auto_feedback,
-            "processing_time_ms": int((time.time() - start_time) * 1000)
-        }
-
-        recognized_solution = create_recognized_solution(session, **solution_data)
-        update_image_status(session, image_id, "processed")
-
-        return {
-            "success": True,
-            "image_id": image_id,
-            "solution_id": recognized_solution.id,
-            "confidence_score": total_confidence,
-            "check_level": check_level
-        }
-
-    except Exception as e:
-        logger.error(f"Error processing {image_id}: {str(e)}")
-        update_image_status(session, image_id, "error", str(e))
-        return {"success": False, "error": str(e)}
-
-
-@router.post("/upload-work")
+@router.post("/upload-work", response_model=UploadWorkResponse)
 async def upload_student_work(
         assignment_id: int,
+        student_id: Optional[int] = None,
         class_id: Optional[int] = None,
         file: UploadFile = File(...),
+        background_tasks: BackgroundTasks = None,
         session: Session = Depends(get_session),
         current_user: User = Depends(get_current_user)
 ):
+    """
+    Загрузить работу ученика для проверки
+    
+    - Если student_id не указан, используется ID текущего пользователя (для учеников)
+    - Если указан student_id, текущий пользователь должен быть учителем этого класса
+    """
     try:
-        # Читаем файл с ограничением размера (5MB максимум)
-        max_size = 5 * 1024 * 1024
+        # Определяем student_id
+        target_student_id = student_id
+        if target_student_id is None:
+            target_student_id = current_user.id
+        elif current_user.role == "teacher":
+            # Проверяем, что ученик в классе учителя
+            if class_id:
+                link = session.exec(
+                    select(ClassStudentLink).where(
+                        ClassStudentLink.class_id == class_id,
+                        ClassStudentLink.student_id == target_student_id
+                    )
+                ).first()
+                if not link:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"Student {target_student_id} is not in class {class_id}"
+                    )
+        else:
+            raise HTTPException(
+                status_code=403,
+                detail="Students can only upload their own work"
+            )
+
+        # Читаем файл с ограничением размера (10MB максимум)
+        max_size = 10 * 1024 * 1024
         file_content = await file.read(max_size)
+
+        # Получаем задание для эталонных данных
+        assignment = session.get(Assignment, assignment_id)
+        if not assignment:
+            raise HTTPException(status_code=404, detail="Assignment not found")
 
         # Создаем запись в БД
         image = create_assessment_image(
             session=session,
             assignment_id=assignment_id,
-            student_id=current_user.id,
+            student_id=target_student_id,
             file_name=file.filename,
             file_size=len(file_content),
             mime_type=file.content_type or "application/octet-stream",
             class_id=class_id
         )
 
-        # Используем OCR API
-        ocr_result = ocr_client.process_image_bytes(file_content, filename=file.filename)
+        # Получаем эталонные данные из задания
+        reference_answer = assignment.reference_answer
+        reference_formulas = None
+        if assignment.reference_solution:
+            # Можно извлечь формулы из решения, пока просто передаем как есть
+            reference_formulas = [assignment.reference_solution]
+
+        # Отправляем в OCR API v1
+        logger.info(f"Sending image {image.id} to OCR API v1 for assessment")
+        
+        ocr_result = ocr_client_v1.assess_solution(
+            image_bytes=file_content,
+            filename=file.filename,
+            reference_answer=reference_answer,
+            reference_formulas=reference_formulas
+        )
 
         if not ocr_result.get("success", False):
-            update_image_status(session, image.id, "error", ocr_result.get("error"))
-            return {
-                "work_id": image.id,
-                "message": "Work uploaded but OCR failed",
-                "error": ocr_result.get("error")
-            }
+            error_msg = ocr_result.get("error", "Unknown OCR error")
+            update_image_status(session, image.id, "error", error_msg)
+            logger.error(f"OCR failed for image {image.id}: {error_msg}")
+            
+            return UploadWorkResponse(
+                work_id=image.id,
+                message="Work uploaded but OCR failed",
+                error=error_msg
+            )
 
-        # Базовая обработка
-        solution_data = {
-            "image_id": image.id,
-            "extracted_text": ocr_result.get("full_text", ""),
-            "text_confidence": ocr_result.get("average_confidence", 50.0),
-            "total_confidence": ocr_result.get("average_confidence", 50.0) / 100.0,
-            "check_level": "level_1" if ocr_result.get("average_confidence", 0) > 70 else "level_3",
-            "auto_feedback": "Работа обработана" if ocr_result.get("success") else "Ошибка обработки",
-            "processing_time_ms": 0
-        }
-
-        create_recognized_solution(session, **solution_data)
+        # Сохраняем результаты
+        assessment_data = ocr_result.get("assessment", {})
+        solution = create_recognized_solution_v1(session, image.id, assessment_data)
+        
         update_image_status(session, image.id, "processed")
+        
+        logger.info(f"Successfully processed image {image.id} with confidence {assessment_data.get('confidence_score', 0)}")
 
         # Очистка памяти
         del file_content
@@ -195,294 +150,16 @@ async def upload_student_work(
 
         return UploadWorkResponse(
             work_id=image.id,
-            message="Work uploaded and processed successfully"
+            message="Work uploaded and processed successfully",
+            confidence_score=assessment_data.get("confidence_score"),
+            check_level=f"level_{assessment_data.get('confidence_level', 3)}"
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Upload error: {str(e)}")
+        logger.error(f"Upload error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
-
-@router.get("/work-status/{work_id}", response_model=ProcessedWorkResponse)
-async def get_work_status(
-        work_id: int,
-        session: Session = Depends(get_session),
-        current_user: User = Depends(get_current_user)
-):
-    """Получить статус обработки работы"""
-    image = get_assessment_image(session, work_id)
-    if not image:
-        raise HTTPException(status_code=404, detail="Work not found")
-
-    # Проверяем права доступа
-    if current_user.role == "student" and image.student_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    # Если работа обработана, получаем решение
-    solution = None
-    confidence_score = None
-    check_level = None
-    extracted_text = None
-    extracted_answer = None
-    processing_time_ms = None
-
-    if image.status == "processed":
-        solution = get_recognized_solution(session, work_id)
-        if solution:
-            confidence_score = solution.total_confidence
-            check_level = solution.check_level
-            extracted_text = solution.extracted_text[:500] + "..." if solution.extracted_text else None
-            extracted_answer = solution.extracted_answer
-            processing_time_ms = solution.processing_time_ms
-
-    return ProcessedWorkResponse(
-        work_id=work_id,
-        status=image.status,
-        confidence_score=confidence_score,
-        check_level=check_level,
-        extracted_text=extracted_text,
-        extracted_answer=extracted_answer,
-        processing_time_ms=processing_time_ms,
-        error_message=image.error_message
-    )
-
-
-@router.get("/work-details/{work_id}", response_model=DetailedAnalysisResponse)
-async def get_work_details(
-        work_id: int,
-        session: Session = Depends(get_session),
-        current_user: User = Depends(get_current_user)
-):
-    """Получить детальный анализ работы"""
-
-    image = get_assessment_image(session, work_id)
-    if not image:
-        raise HTTPException(status_code=404, detail="Work not found")
-
-    # Проверяем права доступа
-    if current_user.role == "student" and image.student_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    if image.status != "processed":
-        raise HTTPException(status_code=400, detail="Work not processed yet")
-
-    solution = get_recognized_solution(session, work_id)
-    if not solution:
-        raise HTTPException(status_code=404, detail="Solution not found")
-
-    # Получаем данные задания для эталонного ответа
-    assignment = session.get(Assignment, image.assignment_id)
-    reference_answer = assignment.reference_answer if assignment else None
-
-    # Формируем формулы из JSON
-    formulas = []
-    if solution.extracted_formulas_json:
-        import json
-        try:
-            formulas_data = json.loads(solution.extracted_formulas_json)
-            formulas = [
-                {
-                    "latex": f.get("latex", ""),
-                    "confidence": f.get("confidence", 0.0),
-                    "position": f.get("bbox", {}),
-                    "is_correct": None  # Можно добавить проверку
-                }
-                for f in formulas_data[:10]  # Ограничиваем количество
-            ]
-        except:
-            formulas = []
-
-    return DetailedAnalysisResponse(
-        work_id=work_id,
-        student_id=image.student_id,
-        assignment_id=image.assignment_id,
-        full_text=solution.extracted_text,
-        formulas=formulas,
-        extracted_answer=solution.extracted_answer,
-        reference_answer=reference_answer,
-        ocr_confidence=solution.ocr_confidence or 0.0,
-        solution_structure_confidence=solution.solution_structure_confidence or 0.0,
-        formula_confidence=solution.formula_confidence or 0.0,
-        answer_match_confidence=solution.answer_match_confidence or 0.0,
-        total_confidence=solution.total_confidence or 0.0,
-        check_level=solution.check_level,
-        suggested_grade=solution.suggested_grade,
-        auto_feedback=solution.auto_feedback or "",
-        annotated_image_url=image.processed_image_path,
-        problem_areas=[],  # Можно добавить логику определения проблемных зон
-        processing_time_ms=solution.processing_time_ms or 0,
-        processed_at=solution.recognized_at
-    )
-
-
-@router.post("/verify/{work_id}", response_model=TeacherVerificationResponse)
-async def verify_work(
-        work_id: int,
-        verification: TeacherVerificationRequest,
-        session: Session = Depends(get_session),
-        current_user: User = Depends(require_role("teacher"))
-):
-    """Учитель проверяет и оценивает работу"""
-
-    image = get_assessment_image(session, work_id)
-    if not image:
-        raise HTTPException(status_code=404, detail="Work not found")
-
-    # Проверяем, что работа из класса учителя
-    class_ = session.get(Class, image.class_id)
-    if not class_ or class_.teacher_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not your class")
-
-    solution = get_recognized_solution(session, work_id)
-    if not solution:
-        raise HTTPException(status_code=400, detail="Solution not found")
-
-    # Создаем запись о проверке
-    result = create_assessment_result(
-        session=session,
-        solution_id=solution.id,
-        teacher_id=current_user.id,
-        teacher_verdict=verification.verdict,
-        teacher_score=verification.score,
-        teacher_feedback=verification.feedback,
-        corrected_text=verification.corrected_text,
-        corrected_answer=verification.corrected_answer,
-        system_score=solution.suggested_grade,
-        verified_at=datetime.utcnow()
-    )
-
-    # Если есть исправления, сохраняем как образец для обучения
-    if verification.corrected_text and solution.extracted_text:
-        from ..crud.assessment import create_training_sample
-
-        create_training_sample(
-            session=session,
-            image_path=image.original_image_path,
-            original_text=solution.extracted_text,
-            corrected_text=verification.corrected_text,
-            subject=image.assignment.subject if hasattr(image.assignment, 'subject') else None,
-            handwriting_style="student"
-        )
-
-    return TeacherVerificationResponse(
-        result_id=result.id,
-        work_id=work_id,
-        teacher_id=current_user.id,
-        verdict=result.teacher_verdict,
-        score=result.teacher_score,
-        feedback=result.teacher_feedback,
-        verified_at=result.verified_at or datetime.utcnow()
-    )
-
-
-@router.get("/class/{class_id}/works", response_model=List[StudentWorkItem])
-async def get_class_works(
-        class_id: int,
-        assignment_id: Optional[int] = None,
-        status: Optional[str] = None,
-        check_level: Optional[str] = None,
-        limit: int = 100,
-        offset: int = 0,
-        session: Session = Depends(get_session),
-        current_user: User = Depends(require_role("teacher"))
-):
-    """Получить список работ класса"""
-
-    # Проверяем, что класс принадлежит учителю
-    class_ = session.get(Class, class_id)
-    if not class_ or class_.teacher_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not your class")
-
-    works = get_class_assessments(
-        session=session,
-        class_id=class_id,
-        assignment_id=assignment_id,
-        status=status,
-        check_level=check_level,
-        limit=limit,
-        offset=offset
-    )
-
-    result = []
-    for work in works:
-        # Получаем информацию о студенте
-        student = session.get(User, work.student_id)
-        student_name = student.name if student else "Unknown"
-        student_surname = student.surname if student else "Student"
-
-        # Получаем решение если есть
-        solution = get_recognized_solution(session, work.id)
-
-        # Получаем оценку учителя если есть
-        teacher_score = None
-        if solution:
-            result = get_assessment_result(session, solution.id)
-            if result:
-                teacher_score = result.teacher_score
-
-        result.append(StudentWorkItem(
-            work_id=work.id,
-            student_id=work.student_id,
-            student_name=student_name,
-            student_surname=student_surname,
-            status=work.status,
-            check_level=solution.check_level if solution else None,
-            confidence_score=solution.total_confidence if solution else None,
-            teacher_score=teacher_score,
-            system_score=solution.suggested_grade if solution else None,
-            uploaded_at=work.upload_time
-        ))
-
-    return result
-
-
-@router.get("/class/{class_id}/summary", response_model=ClassAssessmentSummary)
-async def get_class_summary(
-        class_id: int,
-        assignment_id: Optional[int] = None,
-        session: Session = Depends(get_session),
-        current_user: User = Depends(require_role("teacher"))
-):
-    """Получить сводку по работам класса"""
-
-    # Проверяем, что класс принадлежит учителю
-    class_ = session.get(Class, class_id)
-    if not class_ or class_.teacher_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not your class")
-
-    # Получаем всех студентов класса
-    from ..models import ClassStudentLink
-    links = session.exec(
-        select(ClassStudentLink).where(ClassStudentLink.class_id == class_id)
-    ).all()
-
-    total_students = len(links)
-
-    # Получаем сводку из CRUD
-    summary = get_class_assessment_summary(session, class_id, assignment_id)
-
-    # Получаем временные рамки
-    works = get_class_assessments(session, class_id, assignment_id)
-    first_upload = min([w.upload_time for w in works]) if works else None
-    last_upload = max([w.upload_time for w in works]) if works else None
-
-    # Определяем общие ошибки (упрощенно)
-    common_errors = []
-
-    return ClassAssessmentSummary(
-        class_id=class_id,
-        assignment_id=assignment_id,
-        total_students=total_students,
-        submitted_works=summary.get("total_works", 0),
-        processed_works=summary.get("processed_works", 0),
-        level_1_count=summary.get("level_counts", {}).get("level_1", 0),
-        level_2_count=summary.get("level_counts", {}).get("level_2", 0),
-        level_3_count=summary.get("level_counts", {}).get("level_3", 0),
-        avg_confidence=summary.get("avg_confidence"),
-        avg_processing_time_ms=None,  # Можно добавить расчет
-        common_errors=common_errors,
-        first_upload=first_upload,
-        last_upload=last_upload
-    )
 
 
 @router.post("/batch-upload", response_model=BatchUploadResponse)
@@ -493,26 +170,42 @@ async def batch_upload_works(
         session: Session = Depends(get_session),
         current_user: User = Depends(require_role("teacher"))
 ):
-    """Пакетная загрузка работ (синхронная обработка)"""
+    """
+    Пакетная загрузка работ для всего класса
+    Ожидаются файлы с именами вида: {student_id}_{filename}.ext
+    """
     successful_uploads = []
     failed_uploads = []
+    
+    # Проверяем, что класс принадлежит учителю
+    class_ = session.get(Class, class_id)
+    if not class_ or class_.teacher_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not your class")
+    
+    # Получаем задание
+    assignment = session.get(Assignment, assignment_id)
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+    
+    reference_answer = assignment.reference_answer
+    reference_formulas = [assignment.reference_solution] if assignment.reference_solution else None
 
     for file in files:
         try:
             filename = file.filename
             student_id = None
 
-            # Пробуем извлечь student_id из имени файла
+            # Извлекаем student_id из имени файла (формат: "123_solution.jpg")
             if '_' in filename:
                 try:
                     student_id = int(filename.split('_')[0])
-                except:
+                except ValueError:
                     pass
 
             if not student_id:
                 failed_uploads.append({
                     "filename": filename,
-                    "error": "Cannot extract student ID from filename"
+                    "error": "Cannot extract student ID from filename (expected format: {student_id}_*.*)"
                 })
                 continue
 
@@ -533,28 +226,37 @@ async def batch_upload_works(
 
             # Читаем содержимое файла
             file_content = await file.read()
-            file_size = len(file_content)
-
-            # Создаем запись в БД (без сохранения файла на диск)
+            
+            # Создаем запись в БД
             image = create_assessment_image(
                 session=session,
                 assignment_id=assignment_id,
                 student_id=student_id,
                 file_name=filename,
-                file_size=file_size,
+                file_size=len(file_content),
                 mime_type=file.content_type or "application/octet-stream",
                 class_id=class_id
             )
 
-            # СИНХРОННАЯ обработка из байтов
-            process_result = process_image_sync(image.id, file_content, session)
+            # Отправляем в OCR API
+            ocr_result = ocr_client_v1.assess_solution(
+                image_bytes=file_content,
+                filename=filename,
+                reference_answer=reference_answer,
+                reference_formulas=reference_formulas
+            )
 
-            if process_result.get("success"):
+            if ocr_result.get("success", False):
+                assessment_data = ocr_result.get("assessment", {})
+                create_recognized_solution_v1(session, image.id, assessment_data)
+                update_image_status(session, image.id, "processed")
                 successful_uploads.append(image.id)
             else:
+                error_msg = ocr_result.get("error", "Unknown error")
+                update_image_status(session, image.id, "error", error_msg)
                 failed_uploads.append({
                     "filename": filename,
-                    "error": process_result.get('error', 'Processing failed'),
+                    "error": error_msg,
                     "image_id": image.id
                 })
 
@@ -573,110 +275,123 @@ async def batch_upload_works(
     )
 
 
-@router.get("/dashboard/stats", response_model=DashboardStats)
-async def get_dashboard_stats(
-        days: int = 30,
+@router.get("/work-details/{work_id}", response_model=DetailedAnalysisResponse)
+async def get_work_details(
+        work_id: int,
+        include_steps: bool = Query(True, description="Включить детальный анализ шагов"),
         session: Session = Depends(get_session),
-        current_user: User = Depends(require_role("teacher"))
+        current_user: User = Depends(get_current_user)
 ):
-    """Получить статистику для дашборда учителя"""
+    """Получить детальный анализ работы"""
+    image = get_assessment_image(session, work_id)
+    if not image:
+        raise HTTPException(status_code=404, detail="Work not found")
 
-    stats = get_teacher_dashboard_stats(session, current_user.id, days)
+    # Проверяем права доступа
+    if current_user.role == "student" and image.student_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied")
 
-    if "error" in stats:
-        raise HTTPException(status_code=404, detail=stats["error"])
+    if image.status != "processed":
+        raise HTTPException(status_code=400, detail="Work not processed yet")
 
-    return DashboardStats(
-        total_assignments=0,  # Можно добавить расчет
-        total_works_processed=stats["processed_works"],
-        time_saved_hours=stats["time_saved_hours"],
-        avg_confidence=stats["avg_confidence"],
-        accuracy_rate=stats["accuracy_rate"],
-        daily_stats=stats["daily_stats"]
+    solution = get_recognized_solution(session, work_id)
+    if not solution:
+        raise HTTPException(status_code=404, detail="Solution not found")
+
+    # Получаем данные задания для эталонного ответа
+    assignment = session.get(Assignment, image.assignment_id)
+    reference_answer = assignment.reference_answer if assignment else None
+
+    # Парсим формулы из JSON
+    formulas = []
+    if solution.extracted_formulas_json:
+        try:
+            formulas_data = json.loads(solution.extracted_formulas_json)
+            formulas = [
+                {
+                    "latex": f.get("latex", ""),
+                    "confidence": f.get("confidence", 0.0),
+                    "position": f.get("bbox", {}),
+                    "is_correct": None
+                }
+                for f in formulas_data[:10]
+            ]
+        except:
+            formulas = []
+
+    # Парсим шаги анализа
+    problem_areas = []
+    if include_steps and solution.steps_analysis_json:
+        try:
+            steps = json.loads(solution.steps_analysis_json)
+            # Преобразуем шаги в проблемные области, где is_correct=False
+            for step in steps:
+                if not step.get("is_correct", True):
+                    problem_areas.append({
+                        "step_id": step.get("step_id"),
+                        "found_formula": step.get("found_formula"),
+                        "expected_formula": step.get("expected_formula"),
+                        "description": "Неверная формула или вычисление"
+                    })
+        except:
+            pass
+
+    return DetailedAnalysisResponse(
+        work_id=work_id,
+        student_id=image.student_id,
+        assignment_id=image.assignment_id,
+        full_text=solution.extracted_text,
+        formulas=formulas,
+        extracted_answer=solution.extracted_answer,
+        reference_answer=reference_answer,
+        ocr_confidence=solution.ocr_confidence or 0.0,
+        solution_structure_confidence=solution.solution_structure_confidence or 0.0,
+        formula_confidence=solution.formula_confidence or 0.0,
+        answer_match_confidence=solution.answer_match_confidence or 0.0,
+        total_confidence=solution.total_confidence or 0.0,
+        check_level=solution.check_level,
+        suggested_grade=solution.suggested_grade,
+        auto_feedback=solution.auto_feedback or solution.teacher_comment or "",
+        annotated_image_url=image.processed_image_path,
+        problem_areas=problem_areas,
+        processing_time_ms=solution.processing_time_ms or 0,
+        processed_at=solution.recognized_at
     )
 
 
-@router.get("/common-errors/{class_id}", response_model=List[CommonError])
-async def get_common_errors(
-        class_id: int,
-        assignment_id: Optional[int] = None,
-        session: Session = Depends(get_session),
-        current_user: User = Depends(require_role("teacher"))
-):
-    """Получить список общих ошибок в классе"""
-
-    # Проверяем, что класс принадлежит учителю
-    class_ = session.get(Class, class_id)
-    if not class_ or class_.teacher_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not your class")
-
-    # Получаем все работы класса
-    works = get_class_assessments(session, class_id, assignment_id, status="processed")
-
-    errors = []
-
-    # Анализируем автоматическую обратную связь
-    error_counts = {}
-    for work in works:
-        solution = get_recognized_solution(session, work.id)
-        if solution and solution.auto_feedback:
-            # Извлекаем ключевые фразы из обратной связи
-            feedback = solution.auto_feedback.lower()
-
-            if "низкое качество распознавания" in feedback:
-                error_counts["low_ocr_quality"] = error_counts.get("low_ocr_quality", 0) + 1
-            if "неясная структура" in feedback:
-                error_counts["unclear_structure"] = error_counts.get("unclear_structure", 0) + 1
-            if "проблемы с распознаванием формул" in feedback:
-                error_counts["formula_recognition"] = error_counts.get("formula_recognition", 0) + 1
-            if "расхождение в ответе" in feedback:
-                error_counts["answer_mismatch"] = error_counts.get("answer_mismatch", 0) + 1
-
-    total_works = len(works)
-
-    for error_type, count in error_counts.items():
-        percentage = (count / total_works * 100) if total_works > 0 else 0
-
-        error_names = {
-            "low_ocr_quality": "Низкое качество распознавания",
-            "unclear_structure": "Неясная структура решения",
-            "formula_recognition": "Проблемы с формулами",
-            "answer_mismatch": "Расхождение в ответе"
-        }
-
-        examples = ["Пример ошибки 1", "Пример ошибки 2"]  # Можно добавить реальные примеры
-
-        errors.append(CommonError(
-            error_type=error_names.get(error_type, error_type),
-            count=count,
-            percentage=round(percentage, 1),
-            examples=examples
-        ))
-
-    return errors
-
-
-@router.get("/health/ocr")
+@router.get("/health/ocr", response_model=dict)
 async def check_ocr_health(
         session: Session = Depends(get_session),
         current_user: User = Depends(get_current_user)
 ):
-    """Проверить состояние OCR API"""
+    """Проверить состояние OCR API v1"""
     try:
-        ocr_client = get_ocr_client()
-
         # Проверяем доступность API
-        is_healthy = ocr_client.health_check()
-        languages = ocr_client.get_languages()
+        health = ocr_client_v1.health_check()
+        queue_status = ocr_client_v1.get_queue_status()
 
         return {
-            "ocr_api_available": is_healthy,
-            "supported_languages": languages,
-            "ocr_api_url": os.getenv("OCR_API_URL", "not set")
+            "ocr_api_available": health.get("status") == "healthy",
+            "services": health.get("services", {}),
+            "queue_status": queue_status,
+            "ocr_api_url": os.getenv("OCR_API_URL", "not set"),
+            "api_version": "v1"
         }
     except Exception as e:
         logger.error(f"Error checking OCR health: {str(e)}")
         return {
             "ocr_api_available": False,
-            "error": str(e)
+            "error": str(e),
+            "api_version": "v1"
         }
+
+
+@router.get("/job/{job_id}", response_model=dict)
+async def get_job_status(
+        job_id: str,
+        session: Session = Depends(get_session),
+        current_user: User = Depends(get_current_user)
+):
+    """Получить статус задачи по ID (для асинхронной обработки)"""
+    status = ocr_client_v1.get_job_status(job_id)
+    return status
