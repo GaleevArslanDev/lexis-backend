@@ -1,4 +1,4 @@
-from sqlmodel import SQLModel, create_engine, Session
+from sqlmodel import SQLModel, create_engine, Session, text
 import os
 import logging
 from fastapi import HTTPException
@@ -42,8 +42,8 @@ def get_session():
     for attempt in range(max_retries):
         try:
             session = Session(engine)
-            # Проверяем соединение
-            session.execute("SELECT 1")
+            # ИСПРАВЛЕНИЕ: используем text() для текстового SQL
+            session.execute(text("SELECT 1"))
             yield session
             break
         except Exception as e:
