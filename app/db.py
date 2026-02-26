@@ -3,7 +3,7 @@ import os
 import logging
 from fastapi import HTTPException
 from urllib.parse import urlparse
-import time
+from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
@@ -17,11 +17,11 @@ logger.info(f"Connecting to Supabase: host={parsed.hostname}, database={parsed.p
 engine = create_engine(
     DATABASE_URL,
     echo=False,
-    pool_size=5,  # Уменьшаем размер пула
-    max_overflow=2,  # Минимум дополнительных соединений
-    pool_pre_ping=True,  # Проверять соединение перед использованием
-    pool_recycle=60,  # Пересоздавать соединения каждые 60 секунд
-    pool_timeout=30,  # Таймаут ожидания соединения
+    pool_size=5,
+    max_overflow=2,
+    pool_pre_ping=True,
+    pool_recycle=60,
+    pool_timeout=30,
     connect_args={
         "connect_timeout": 10,
         "keepalives": 1,
@@ -34,29 +34,16 @@ engine = create_engine(
 
 
 def get_session():
-    """Генератор сессий с повторными попытками"""
-    session = None
-    max_retries = 3
-    retry_delay = 1
-
-    for attempt in range(max_retries):
+    """Генератор сессий"""
+    with Session(engine) as session:
         try:
-            session = Session(engine)
-            # ИСПРАВЛЕНИЕ: используем text() для текстового SQL
+            # Проверяем соединение
             session.execute(text("SELECT 1"))
             yield session
-            break
         except Exception as e:
-            logger.error(f"Database session error (attempt {attempt + 1}/{max_retries}): {e}")
-            if session:
-                session.close()
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay * (attempt + 1))
-            else:
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Database connection failed after {max_retries} attempts: {str(e)}"
-                )
-        finally:
-            if session:
-                session.close()
+            logger.error(f"Database session error: {e}")
+            session.rollback()
+            raise HTTPException(
+                status_code=503,
+                detail=f"Database connection failed: {str(e)}"
+            )
