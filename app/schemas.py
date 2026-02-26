@@ -44,6 +44,52 @@ class AssignmentCreate(BaseModel):
     description: Optional[str] = None
     type: str = "essay"
 
+    # Новые поля для AssessIt
+    reference_solution: Optional[str] = None
+    reference_answer: Optional[str] = None
+    subject: Optional[str] = None  # 'math', 'physics', 'chemistry'
+    difficulty: Optional[str] = None  # 'easy', 'medium', 'hard'
+    max_score: Optional[float] = None
+
+    @validator('max_score')
+    def validate_max_score(cls, v):
+        if v is not None and v <= 0:
+            raise ValueError('max_score must be positive')
+        return v
+
+    @validator('subject')
+    def validate_subject(cls, v):
+        if v is not None and v not in ['math', 'physics', 'chemistry']:
+            raise ValueError('subject must be one of: math, physics, chemistry')
+        return v
+
+    @validator('difficulty')
+    def validate_difficulty(cls, v):
+        if v is not None and v not in ['easy', 'medium', 'hard']:
+            raise ValueError('difficulty must be one of: easy, medium, hard')
+        return v
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AssignmentResponse(BaseModel):
+    id: int
+    class_id: int
+    title: str
+    description: Optional[str] = None
+    type: str
+    created_at: datetime
+    due_date: Optional[datetime] = None
+
+    # Поля AssessIt
+    reference_solution: Optional[str] = None
+    reference_answer: Optional[str] = None
+    subject: Optional[str] = None
+    difficulty: Optional[str] = None
+    max_score: Optional[float] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
 
 class QuestionCreate(BaseModel):
     assignment_id: int
