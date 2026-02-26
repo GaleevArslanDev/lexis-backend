@@ -47,6 +47,9 @@ class OCRAPIClientV1:
             if reference_formulas:
                 data["reference_formulas"] = ";".join(reference_formulas)
 
+            logger.debug("Data")
+            logger.debug(data)
+
             response = requests.post(
                 f"{self.base_url}/api/v1/ocr/assess",
                 files=files,
