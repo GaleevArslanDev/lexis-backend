@@ -66,10 +66,10 @@ class OCRAPIClientV1:
                     "assessment": None
                 }
 
-            result = response.text()
+            result = response.json()
 
             print("Response:")
-            print(result)
+            print(response.text)
 
             if not result.get("success", False):
                 return {
