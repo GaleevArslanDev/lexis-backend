@@ -195,7 +195,7 @@ class RecognizedSolution(SQLModel, table=True):
     image_id: int = Field(foreign_key="assessmentimage.id")
 
     # Распознанный текст
-    extracted_text: list[str]
+    extracted_text: str
     cleaned_text: Optional[str] = None
     text_confidence: Optional[float] = None  # Средняя уверенность OCR
 
