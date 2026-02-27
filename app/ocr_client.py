@@ -69,7 +69,7 @@ class OCRAPIClientV1:
             result = response.json()
 
             print("Response:")
-            print(response)
+            print(result)
 
             if not result.get("success", False):
                 return {
