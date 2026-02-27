@@ -47,7 +47,7 @@ class OCRAPIClientV1:
             if reference_formulas:
                 data["reference_formulas"] = ";".join(reference_formulas)
 
-            print("Data")
+            print("Data:")
             print(data)
 
             response = requests.post(
@@ -57,6 +57,9 @@ class OCRAPIClientV1:
                 headers=self.headers,
                 timeout=120  # Увеличиваем таймаут для полной обработки
             )
+
+            print("Response:")
+            print(response)
 
             if response.status_code != 200:
                 logger.error(f"OCR API v1 error: {response.status_code} - {response.text}")

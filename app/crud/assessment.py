@@ -38,7 +38,7 @@ def create_recognized_solution_v1(
         image_id=image_id,
         extracted_text="",  # Будет заполнено позже, если нужно
         text_confidence=scores.get("c_ocr", 0.0) * 100,  # Конвертируем в проценты
-        formulas_count=0,  # Можно извлечь из steps при необходимости
+        formulas_count=len(steps) if steps else 0,  # Можно извлечь из steps при необходимости
         
         # Confidence scores
         ocr_confidence=scores.get("c_ocr", 0.0),
