@@ -36,7 +36,7 @@ def create_recognized_solution_v1(
     
     solution = RecognizedSolution(
         image_id=image_id,
-        extracted_text="",  # Будет заполнено позже, если нужно
+        extracted_text=[item.get("found_formula", "") for item in steps] if steps else [],  # Будет заполнено позже, если нужно
         text_confidence=scores.get("c_ocr", 0.0) * 100,  # Конвертируем в проценты
         formulas_count=len(steps) if steps else 0,  # Можно извлечь из steps при необходимости
         
