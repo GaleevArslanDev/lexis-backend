@@ -58,9 +58,6 @@ class OCRAPIClientV1:
                 timeout=120  # Увеличиваем таймаут для полной обработки
             )
 
-            print("Response:")
-            print(response)
-
             if response.status_code != 200:
                 logger.error(f"OCR API v1 error: {response.status_code} - {response.text}")
                 return {
@@ -70,6 +67,9 @@ class OCRAPIClientV1:
                 }
 
             result = response.json()
+
+            print("Response:")
+            print(response)
 
             if not result.get("success", False):
                 return {
