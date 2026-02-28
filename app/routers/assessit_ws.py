@@ -1,4 +1,4 @@
-from fastapi import WebSocket, WebSocketDisconnect, Depends, Query, status
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, Query, status
 from typing import Dict, Set, Optional
 import asyncio
 import json
@@ -14,6 +14,7 @@ from ..exceptions import AppException, ErrorCode
 
 logger = logging.getLogger(__name__)
 
+router = APIRouter(tags=["websocket"])
 
 class ConnectionManager:
     def __init__(self):
