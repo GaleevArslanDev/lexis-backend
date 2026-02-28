@@ -1,3 +1,4 @@
+import asyncio
 from http.client import HTTPException
 from fastapi import FastAPI
 from .exceptions import ErrorCode, AppException, logger
@@ -6,6 +7,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import gc
 import os
+
+from .routers.assessit_ws import start_heartbeat
+
 
 def add_exception_handlers(app):
     @app.exception_handler(AppException)
@@ -84,6 +88,8 @@ def on_startup():
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
+
+    asyncio.create_task(start_heartbeat())
 
     print("AssessIt backend starting with memory optimization")
     print(f"Available memory optimization active")

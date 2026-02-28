@@ -314,27 +314,6 @@ class StudentWorkItem(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-class BatchUploadRequest(BaseModel):
-    assignment_id: int
-    class_id: int
-    student_works: List[Dict[str, Any]]
-
-    @validator('student_works')
-    def validate_student_works(cls, v):
-        if not v:
-            raise ValueError('student_works cannot be empty')
-        return v
-
-
-class BatchUploadResponse(BaseModel):
-    total_uploaded: int
-    successful_uploads: List[int]
-    failed_uploads: List[Dict[str, Any]]
-    batch_id: Optional[str] = None
-
-    model_config = ConfigDict(from_attributes=True)
-
-
 # Схемы для дашборда
 class DashboardStats(BaseModel):
     total_assignments: int
@@ -372,15 +351,6 @@ class PaginatedResponse(BaseModel):
     pagination: PaginationInfo
 
 
-class QueueStatusResponse(BaseModel):
-    queue_size: int
-    estimated_wait_seconds: int
-    estimated_wait_minutes: Optional[float] = None
-    status: str = "idle"  # idle, processing
-
-    model_config = ConfigDict(from_attributes=True)
-
-
 class WorkVerifiedResponse(BaseModel):
     work_id: int
     verdict: str
@@ -388,3 +358,64 @@ class WorkVerifiedResponse(BaseModel):
     verified_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+class BatchUploadItem(BaseModel):
+    """Один элемент пакетной загрузки"""
+    student_id: int
+    file: bytes  # не сериализуется, используется для передачи
+    filename: str
+
+class BatchUploadRequest(BaseModel):
+    """Запрос на пакетную загрузку"""
+    assignment_id: int
+    class_id: int
+    works: List[Dict[str, Any]]  # будет содержать student_id и file
+
+    @validator('works')
+    def validate_works(cls, v):
+        if not v:
+            raise ValueError('works cannot be empty')
+        return v
+
+class BatchUploadResponse(BaseModel):
+    """Ответ на пакетную загрузку"""
+    batch_id: str
+    total_submitted: int
+    queue_position: int
+    estimated_wait_seconds: int
+    status: str = "queued"
+
+class QueueItemStatus(BaseModel):
+    """Статус элемента в очереди"""
+    work_id: int
+    student_id: int
+    student_name: str
+    position: int
+    status: str  # queued, processing, completed, failed
+    queued_at: datetime
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    error: Optional[str] = None
+    result: Optional[Dict[str, Any]] = None
+
+class QueueStatusResponse(BaseModel):
+    """Полный статус очереди"""
+    queue_size: int
+    processing: int
+    completed: int
+    failed: int
+    items: List[QueueItemStatus]
+    estimated_wait_seconds: int
+    avg_processing_time: float
+
+class SystemHealthResponse(BaseModel):
+    """Health check всей системы"""
+    status: str  # healthy, degraded, unhealthy
+    timestamp: datetime
+    version: str
+    components: Dict[str, Any] = {
+        "database": {"status": str, "latency_ms": float},
+        "ocr_api": {"status": str, "latency_ms": float},
+        "websocket": {"status": str, "connections": int},
+        "queue": {"status": str, "size": int}
+    }

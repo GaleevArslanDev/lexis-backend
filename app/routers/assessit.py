@@ -6,12 +6,13 @@ from datetime import datetime
 from typing import List, Optional
 import logging
 import gc
+from sqlalchemy import text
 
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks, Query
+from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks, Query, Form
 from fastapi.responses import JSONResponse
 from sqlmodel import Session, select
 
-from .assessit_ws import manager
+from .assessit_ws import manager, add_works_to_queue
 from ..db import get_session
 from ..dependencies.auth import get_current_user
 from ..dependencies_util import require_role
@@ -40,7 +41,7 @@ from ..schemas import (
     StudentWorkItem,
     BatchUploadResponse,
     DashboardStats,
-    CommonError
+    CommonError, SystemHealthResponse
 )
 
 logger = logging.getLogger(__name__)
@@ -49,146 +50,6 @@ router = APIRouter(prefix="/assessit", tags=["assessit"])
 
 # Инициализация клиента v1
 ocr_client_v1 = get_ocr_client_v1()
-
-
-@router.post("/upload-work", response_model=UploadWorkResponse)
-async def upload_student_work(
-        assignment_id: int,
-        student_id: Optional[int] = None,
-        class_id: Optional[int] = None,
-        file: UploadFile = File(...),
-        wait_for_result: bool = Query(False, description="Ждать результата или добавить в очередь"),
-        session: Session = Depends(get_session),
-        current_user: User = Depends(get_current_user)
-):
-    """
-    Загрузить работу ученика для проверки
-
-    - Если wait_for_result=False (по умолчанию) - работа добавляется в очередь,
-      результат будет отправлен через WebSocket
-    - Если wait_for_result=True - ожидаем результат синхронно (может занять 5-7 секунд)
-    - Если student_id не указан, используется ID текущего пользователя (для учеников)
-    - Если указан student_id, текущий пользователь должен быть учителем этого класса
-    """
-    try:
-        # Определяем student_id
-        target_student_id = student_id
-        if target_student_id is None:
-            target_student_id = current_user.id
-        elif current_user.role == "teacher":
-            # Проверяем, что ученик в классе учителя
-            if class_id:
-                link = session.exec(
-                    select(ClassStudentLink).where(
-                        ClassStudentLink.class_id == class_id,
-                        ClassStudentLink.student_id == target_student_id
-                    )
-                ).first()
-                if not link:
-                    raise HTTPException(
-                        status_code=403,
-                        detail=f"Student {target_student_id} is not in class {class_id}"
-                    )
-        else:
-            raise HTTPException(
-                status_code=403,
-                detail="Students can only upload their own work"
-            )
-
-        # Читаем файл с ограничением размера (10MB максимум)
-        max_size = 10 * 1024 * 1024
-        file_content = await file.read(max_size)
-
-        # Получаем задание для эталонных данных
-        assignment = session.get(Assignment, assignment_id)
-        if not assignment:
-            raise AppException(
-                status_code=404,
-                error_code=ErrorCode.NOT_FOUND,
-                message="Assignment not found",
-                details={"assignment_id": assignment_id}
-            )
-
-        # Создаем запись в БД
-        image = create_assessment_image(
-            session=session,
-            assignment_id=assignment_id,
-            student_id=target_student_id,
-            file_name=file.filename,
-            file_size=len(file_content),
-            mime_type=file.content_type or "application/octet-stream",
-            class_id=class_id or assignment.class_id
-        )
-
-        if not wait_for_result and class_id:
-            student = session.get(User, target_student_id)
-            student_name = f"{student.name} {student.surname}" if student else "Unknown"
-
-            position = await add_work_to_queue(
-                class_id=class_id or assignment.class_id,
-                work_id=image.id,
-                student_name=student_name,
-                image_bytes=file_content,
-                filename=file.filename,
-                reference_answer=assignment.reference_answer,
-                reference_formulas=[assignment.reference_solution] if assignment.reference_solution else None
-            )
-
-            return UploadWorkResponse(
-                work_id=image.id,
-                message=f"Work added to queue at position {position}",
-                queue_position=position,
-                status="queued"
-            )
-
-            # Иначе обрабатываем синхронно
-            try:
-                ocr_result = ocr_client_v1.assess_solution(
-                    image_bytes=file_content,
-                    filename=file.filename,
-                    reference_answer=assignment.reference_answer,
-                    reference_formulas=[assignment.reference_solution] if assignment.reference_solution else None
-                )
-            except Exception as e:
-                # Конвертируем ошибку в AppException
-                update_image_status(session, image.id, "error", str(e))
-                raise handle_ocr_error(e, image.id)
-
-            if not ocr_result.get("success", False):
-                error_msg = ocr_result.get("error", "Unknown OCR error")
-                update_image_status(session, image.id, "error", error_msg)
-
-                raise AppException(
-                    status_code=502,
-                    error_code=ErrorCode.OCR_API_ERROR,
-                    message=error_msg,
-                    details={"image_id": image.id}
-                )
-
-            # Сохраняем результаты
-            assessment_data = ocr_result.get("assessment", {})
-            solution = create_recognized_solution_v1(session, image.id, assessment_data)
-            update_image_status(session, image.id, "processed")
-
-            return UploadWorkResponse(
-                work_id=image.id,
-                message="Work processed successfully",
-                confidence_score=assessment_data.get("confidence_score"),
-                check_level=f"level_{assessment_data.get('confidence_level', 3)}",
-                solution_id=assessment_data.get("solution_id")
-            )
-
-    except AppException:
-        raise
-    except Exception as e:
-        logger.error(f"Upload error: {str(e)}", exc_info=True)
-        raise AppException(
-            status_code=500,
-            error_code=ErrorCode.INTERNAL_ERROR,
-            message="Upload failed",
-            details={"error": str(e)}
-        )
-
 
 @router.get("/dashboard/{teacher_id}", response_model=DashboardStats)
 async def get_dashboard(
@@ -412,117 +273,137 @@ async def get_queue_status(
         "status": "processing" if queue_size > 0 else "idle"
     }
 
+
 @router.post("/batch-upload", response_model=BatchUploadResponse)
 async def batch_upload_works(
-        assignment_id: int,
-        class_id: int,
+        assignment_id: int = Form(...),
+        class_id: int = Form(...),
         files: List[UploadFile] = File(...),
+        students_json: str = Form(...),  # JSON строка с маппингом
         session: Session = Depends(get_session),
-        current_user: User = Depends(require_role("teacher"))
+        current_user: User = Depends(require_role("teacher")),
+        background_tasks: BackgroundTasks = None
 ):
     """
     Пакетная загрузка работ для всего класса
-    Ожидаются файлы с именами вида: {student_id}_{filename}.ext
+
+    Формат students_json:
+    [
+        {"filename": "photo1.jpg", "student_id": 123},
+        {"filename": "photo2.jpg", "student_id": 456},
+        ...
+    ]
+
+    Все работы автоматически попадают в очередь.
+    Статус обработки можно отслеживать через WebSocket.
     """
-    successful_uploads = []
-    failed_uploads = []
-    
-    # Проверяем, что класс принадлежит учителю
-    class_ = session.get(Class, class_id)
-    if not class_ or class_.teacher_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not your class")
-    
-    # Получаем задание
-    assignment = session.get(Assignment, assignment_id)
-    if not assignment:
-        raise HTTPException(status_code=404, detail="Assignment not found")
-    
-    reference_answer = assignment.reference_answer
-    reference_formulas = [assignment.reference_solution] if assignment.reference_solution else None
+    try:
+        # Парсим маппинг студентов
+        student_mapping = json.loads(students_json)
+        if not isinstance(student_mapping, list):
+            raise HTTPException(status_code=400, detail="students_json must be a list")
 
-    for file in files:
-        try:
-            filename = file.filename
-            student_id = None
+        # Создаем словарь filename -> student_id
+        file_to_student = {item["filename"]: item["student_id"] for item in student_mapping}
 
-            # Извлекаем student_id из имени файла (формат: "123_solution.jpg")
-            if '_' in filename:
-                try:
-                    student_id = int(filename.split('_')[0])
-                except ValueError:
-                    pass
+        # Проверяем, что класс принадлежит учителю
+        class_obj = session.get(Class, class_id)
+        if not class_obj or class_obj.teacher_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Not your class")
 
-            if not student_id:
-                failed_uploads.append({
-                    "filename": filename,
-                    "error": "Cannot extract student ID from filename (expected format: {student_id}_*.*)"
-                })
-                continue
+        # Получаем задание
+        assignment = session.get(Assignment, assignment_id)
+        if not assignment:
+            raise HTTPException(status_code=404, detail="Assignment not found")
 
-            # Проверяем, что студент в классе
-            link = session.exec(
-                select(ClassStudentLink).where(
-                    ClassStudentLink.class_id == class_id,
-                    ClassStudentLink.student_id == student_id
+        # Получаем всех учеников класса для проверки
+        students = session.exec(
+            select(User).join(ClassStudentLink).where(ClassStudentLink.class_id == class_id)
+        ).all()
+        valid_student_ids = {s.id for s in students}
+
+        # Создаем словарь student_id -> имя для быстрого доступа
+        student_names = {s.id: f"{s.name} {s.surname}" for s in students}
+
+        # Подготавливаем работы для очереди
+        works_for_queue = []
+        created_images = []
+
+        for file in files:
+            try:
+                # Определяем student_id для этого файла
+                student_id = file_to_student.get(file.filename)
+
+                if not student_id:
+                    raise ValueError(f"No student_id mapping for file {file.filename}")
+
+                if student_id not in valid_student_ids:
+                    raise ValueError(f"Student {student_id} not in class {class_id}")
+
+                # Читаем содержимое файла (макс 10MB)
+                file_content = await file.read()
+                if len(file_content) > 10 * 1024 * 1024:
+                    raise ValueError(f"File {file.filename} exceeds 10MB limit")
+
+                # Создаем запись в БД
+                image = create_assessment_image(
+                    session=session,
+                    assignment_id=assignment_id,
+                    student_id=student_id,
+                    file_name=file.filename,
+                    file_size=len(file_content),
+                    mime_type=file.content_type or "application/octet-stream",
+                    class_id=class_id
                 )
-            ).first()
+                created_images.append(image)
 
-            if not link:
-                failed_uploads.append({
-                    "filename": filename,
-                    "error": f"Student {student_id} not in class"
-                })
-                continue
-
-            # Читаем содержимое файла
-            file_content = await file.read()
-            
-            # Создаем запись в БД
-            image = create_assessment_image(
-                session=session,
-                assignment_id=assignment_id,
-                student_id=student_id,
-                file_name=filename,
-                file_size=len(file_content),
-                mime_type=file.content_type or "application/octet-stream",
-                class_id=class_id
-            )
-
-            # Отправляем в OCR API
-            ocr_result = ocr_client_v1.assess_solution(
-                image_bytes=file_content,
-                filename=filename,
-                reference_answer=reference_answer,
-                reference_formulas=reference_formulas
-            )
-
-            if ocr_result.get("success", False):
-                assessment_data = ocr_result.get("assessment", {})
-                create_recognized_solution_v1(session, image.id, assessment_data)
-                update_image_status(session, image.id, "processed")
-                successful_uploads.append(image.id)
-            else:
-                error_msg = ocr_result.get("error", "Unknown error")
-                update_image_status(session, image.id, "error", error_msg)
-                failed_uploads.append({
-                    "filename": filename,
-                    "error": error_msg,
-                    "image_id": image.id
+                # Подготавливаем для очереди
+                works_for_queue.append({
+                    "work_id": image.id,
+                    "student_id": student_id,
+                    "student_name": student_names.get(student_id, "Unknown"),
+                    "image_bytes": file_content,
+                    "filename": file.filename,
+                    "reference_answer": assignment.reference_answer,
+                    "reference_formulas": [assignment.reference_solution] if assignment.reference_solution else None
                 })
 
-        except Exception as e:
-            logger.error(f"Error uploading {file.filename}: {str(e)}")
-            failed_uploads.append({
-                "filename": file.filename,
-                "error": str(e)
-            })
+            except Exception as e:
+                logger.error(f"Error processing {file.filename}: {str(e)}")
+                # Продолжаем с другими файлами
 
-    return BatchUploadResponse(
-        total_uploaded=len(files),
-        successful_uploads=successful_uploads,
-        failed_uploads=failed_uploads,
-        batch_id=str(uuid.uuid4())
-    )
+        if not works_for_queue:
+            raise HTTPException(status_code=400, detail="No valid works to process")
+
+        # Добавляем все в очередь
+        position = await add_works_to_queue(
+            class_id=class_id,
+            works=works_for_queue,
+            session=session
+        )
+
+        # Оцениваем время ожидания
+        avg_time = manager.get_avg_processing_time(class_id)
+        estimated_wait = len(works_for_queue) * avg_time
+
+        return BatchUploadResponse(
+            batch_id=str(uuid.uuid4()),
+            total_submitted=len(works_for_queue),
+            queue_position=position,
+            estimated_wait_seconds=int(estimated_wait),
+            status="queued"
+        )
+
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON in students_json")
+    except Exception as e:
+        logger.error(f"Batch upload error: {str(e)}", exc_info=True)
+        raise AppException(
+            status_code=500,
+            error_code=ErrorCode.INTERNAL_ERROR,
+            message="Batch upload failed",
+            details={"error": str(e)}
+        )
 
 
 @router.get("/work-details/{work_id}", response_model=DetailedAnalysisResponse)
@@ -644,4 +525,135 @@ async def get_job_status(
 ):
     """Получить статус задачи по ID (для асинхронной обработки)"""
     status = ocr_client_v1.get_job_status(job_id)
+    return status
+
+
+@router.get("/health", response_model=SystemHealthResponse)
+async def system_health(
+        session: Session = Depends(get_session),
+        current_user: User = Depends(get_current_user)
+):
+    """
+    Полный health check системы
+    Доступен только авторизованным пользователям
+    """
+    start_time = time.time()
+    version = "2.0.0"
+    components = {}
+    overall_status = "healthy"
+
+    # 1. Проверка БД
+    try:
+        db_start = time.time()
+        result = session.execute(text("SELECT 1")).first()
+        db_latency = (time.time() - db_start) * 1000
+
+        components["database"] = {
+            "status": "healthy" if result else "degraded",
+            "latency_ms": round(db_latency, 2),
+            "message": "Connected" if result else "Query failed"
+        }
+        if not result:
+            overall_status = "degraded"
+    except Exception as e:
+        components["database"] = {
+            "status": "unhealthy",
+            "latency_ms": None,
+            "message": str(e)
+        }
+        overall_status = "unhealthy"
+
+    # 2. Проверка OCR API
+    try:
+        ocr_start = time.time()
+        from ..ocr_client import get_ocr_client_v1
+        client = get_ocr_client_v1()
+        health = client.health_check()
+        ocr_latency = (time.time() - ocr_start) * 1000
+
+        ocr_status = health.get("status") == "healthy"
+        components["ocr_api"] = {
+            "status": "healthy" if ocr_status else "degraded",
+            "latency_ms": round(ocr_latency, 2),
+            "services": health.get("services", {}),
+            "message": "Connected" if ocr_status else "API degraded"
+        }
+        if not ocr_status:
+            overall_status = "degraded" if overall_status == "healthy" else overall_status
+    except Exception as e:
+        components["ocr_api"] = {
+            "status": "unhealthy",
+            "latency_ms": None,
+            "message": str(e)
+        }
+        overall_status = "unhealthy"
+
+    # 3. Проверка WebSocket
+    try:
+        ws_connections = len(manager.active_connections)
+        components["websocket"] = {
+            "status": "healthy",
+            "connections": ws_connections,
+            "active_classes": len(manager.class_connections),
+            "message": f"{ws_connections} active connections"
+        }
+    except Exception as e:
+        components["websocket"] = {
+            "status": "degraded",
+            "connections": 0,
+            "message": str(e)
+        }
+        overall_status = "degraded"
+
+    # 4. Проверка очередей
+    try:
+        total_queue_size = sum(len(q) for q in manager.class_queues.values())
+        processing_count = 0
+        for q in manager.class_queues.values():
+            processing_count += sum(1 for item in q if item.status == "processing")
+
+        components["queue"] = {
+            "status": "healthy",
+            "size": total_queue_size,
+            "processing": processing_count,
+            "active_queues": len(manager.class_queues),
+            "message": f"{total_queue_size} items in queues"
+        }
+    except Exception as e:
+        components["queue"] = {
+            "status": "degraded",
+            "size": 0,
+            "message": str(e)
+        }
+        overall_status = "degraded"
+
+    total_latency = (time.time() - start_time) * 1000
+
+    return SystemHealthResponse(
+        status=overall_status,
+        timestamp=datetime.utcnow(),
+        version=version,
+        components=components
+    )
+
+
+@router.get("/queue/{class_id}/detailed", response_model=dict)
+async def get_detailed_queue_status(
+        class_id: int,
+        session: Session = Depends(get_session),
+        current_user: User = Depends(require_role("teacher"))
+):
+    """Получить детальный статус очереди для класса"""
+
+    # Проверяем права
+    class_obj = session.get(Class, class_id)
+    if not class_obj or class_obj.teacher_id != current_user.id:
+        raise AppException(
+            status_code=403,
+            error_code=ErrorCode.ACCESS_DENIED,
+            message="Not your class",
+            details={"class_id": class_id}
+        )
+
+    status = await manager.get_queue_status(class_id)
     return status

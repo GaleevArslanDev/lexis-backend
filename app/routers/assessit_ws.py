@@ -1,36 +1,101 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, Query, status
-from typing import Dict, Set, Optional
+from typing import Dict, Set, Optional, List
 import asyncio
 import json
 import logging
 from datetime import datetime, timedelta
 from sqlmodel import Session, select
 from jose import jwt
+import uuid
+import time
 
 from ..db import get_session
 from ..models import User, Class, AssessmentImage, RecognizedSolution
 from ..utils.security import SECRET_KEY, ALGORITHM
 from ..exceptions import AppException, ErrorCode
+from ..ocr_client import get_ocr_client_v1
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["websocket"])
 
+
+class QueueItem:
+    """Элемент очереди с полным статусом"""
+
+    def __init__(self, work_id: int, student_id: int, student_name: str,
+                 image_bytes: bytes, filename: str,
+                 reference_answer: Optional[str] = None,
+                 reference_formulas: Optional[list] = None):
+        self.id = str(uuid.uuid4())
+        self.work_id = work_id
+        self.student_id = student_id
+        self.student_name = student_name
+        self.image_bytes = image_bytes
+        self.filename = filename
+        self.reference_answer = reference_answer
+        self.reference_formulas = reference_formulas
+        self.status = "queued"  # queued, processing, completed, failed
+        self.position = 0
+        self.queued_at = datetime.utcnow()
+        self.started_at = None
+        self.completed_at = None
+        self.error = None
+        self.result = None
+
+
 class ConnectionManager:
     def __init__(self):
         # Класс -> множество подключений учителей
         self.class_connections: Dict[int, Set[WebSocket]] = {}
-        # Словарь для хранения очередей по классам
-        self.class_queues: Dict[int, asyncio.Queue] = {}
+        # Очереди по классам (список QueueItem)
+        self.class_queues: Dict[int, List[QueueItem]] = {}
         # Задачи обработки очередей
         self.processing_tasks: Dict[int, asyncio.Task] = {}
+        # Блокировки для каждой очереди
+        self.queue_locks: Dict[int, asyncio.Lock] = {}
+        # Статистика обработки
+        self.processing_stats: Dict[int, List[float]] = {}
+        # Heartbeat задача
+        self.heartbeat_task = None
+        # Активные соединения для heartbeat
+        self.active_connections: Set[WebSocket] = set()
+
+    async def start_heartbeat(self):
+        """Запускаем фоновую задачу для heartbeat"""
+        while True:
+            try:
+                await asyncio.sleep(30)  # Каждые 30 секунд
+                disconnected = set()
+                for conn in self.active_connections:
+                    try:
+                        await conn.send_json({"type": "heartbeat", "timestamp": datetime.utcnow().isoformat()})
+                    except:
+                        disconnected.add(conn)
+
+                # Удаляем отключившиеся соединения
+                for conn in disconnected:
+                    self.active_connections.discard(conn)
+                    # Также удаляем из class_connections
+                    for class_id, connections in self.class_connections.items():
+                        if conn in connections:
+                            connections.discard(conn)
+            except Exception as e:
+                logger.error(f"Heartbeat error: {e}")
 
     async def connect(self, websocket: WebSocket, class_id: int, user_id: int):
         await websocket.accept()
+
+        # Добавляем в активные соединения
+        self.active_connections.add(websocket)
+
+        # Добавляем в класс
         if class_id not in self.class_connections:
             self.class_connections[class_id] = set()
-            # Создаем очередь для этого класса
-            self.class_queues[class_id] = asyncio.Queue()
+            self.class_queues[class_id] = []
+            self.queue_locks[class_id] = asyncio.Lock()
+            self.processing_stats[class_id] = []
+
             # Запускаем обработчик очереди
             self.processing_tasks[class_id] = asyncio.create_task(
                 self.process_queue(class_id)
@@ -42,18 +107,24 @@ class ConnectionManager:
         await self.send_queue_status(class_id)
 
         logger.info(
-            f"User {user_id} connected to class {class_id}. Total connections: {len(self.class_connections[class_id])}")
+            f"User {user_id} connected to class {class_id}. "
+            f"Total connections: {len(self.class_connections[class_id])}"
+        )
 
     def disconnect(self, websocket: WebSocket, class_id: int):
+        # Удаляем из активных
+        self.active_connections.discard(websocket)
+
+        # Удаляем из класса
         if class_id in self.class_connections:
             self.class_connections[class_id].discard(websocket)
+
             # Если никого не осталось, останавливаем обработку очереди
             if not self.class_connections[class_id]:
                 if class_id in self.processing_tasks:
                     self.processing_tasks[class_id].cancel()
                     del self.processing_tasks[class_id]
-                if class_id in self.class_queues:
-                    del self.class_queues[class_id]
+                # Очередь сохраняем - она не должна очищаться при отключении всех
 
     async def broadcast_to_class(self, class_id: int, message: dict):
         """Отправить сообщение всем подключенным к классу"""
@@ -68,150 +139,264 @@ class ConnectionManager:
             # Удаляем отключившихся
             for conn in disconnected:
                 self.class_connections[class_id].discard(conn)
+                self.active_connections.discard(conn)
 
-    async def add_to_queue(self, class_id: int, work_data: dict):
-        """Добавить работу в очередь на обработку"""
-        if class_id not in self.class_queues:
-            self.class_queues[class_id] = asyncio.Queue()
+    async def add_to_queue(self, class_id: int, items: List[QueueItem]) -> int:
+        """Добавить несколько работ в очередь"""
+        async with self.queue_locks[class_id]:
+            current_size = len(self.class_queues[class_id])
 
-        # Добавляем время постановки в очередь
-        work_data["queued_at"] = datetime.utcnow().isoformat()
-        work_data["position"] = self.class_queues[class_id].qsize() + 1
+            # Добавляем все элементы с правильными позициями
+            for i, item in enumerate(items):
+                item.position = current_size + i + 1
+                self.class_queues[class_id].append(item)
 
-        await self.class_queues[class_id].put(work_data)
+            # Обновляем статус очереди
+            await self.send_queue_status(class_id)
 
-        # Обновляем статус очереди
-        await self.send_queue_status(class_id)
-
-        return work_data["position"]
+            return current_size + 1  # Позиция первого элемента
 
     async def send_queue_status(self, class_id: int):
-        """Отправить статус очереди всем подключенным"""
-        if class_id in self.class_queues:
-            queue_size = self.class_queues[class_id].qsize()
+        """Отправить детальный статус очереди"""
+        if class_id not in self.class_queues:
+            return
 
-            # Оцениваем время ожидания (в среднем 5-7 секунд на работу)
-            avg_processing_time = 6  # секунд
-            estimated_wait = queue_size * avg_processing_time
+        async with self.queue_locks[class_id]:
+            queue = self.class_queues[class_id]
 
+            # Считаем статистику
+            queued = [q for q in queue if q.status == "queued"]
+            processing = [q for q in queue if q.status == "processing"]
+            completed = [q for q in queue if q.status == "completed"]
+            failed = [q for q in queue if q.status == "failed"]
+
+            # Оценка времени
+            avg_time = self.get_avg_processing_time(class_id)
+            estimated_wait = len(queued) * avg_time
+
+            # Формируем статус
             status_message = {
                 "type": "queue_status",
                 "data": {
-                    "queue_size": queue_size,
+                    "queue_size": len(queue),
+                    "queued": len(queued),
+                    "processing": len(processing),
+                    "completed": len(completed),
+                    "failed": len(failed),
                     "estimated_wait_seconds": estimated_wait,
                     "estimated_wait_minutes": round(estimated_wait / 60, 1),
-                    "processing_speed": f"{avg_processing_time}s per work"
+                    "avg_processing_time": round(avg_time, 1),
+                    "items": [
+                        {
+                            "work_id": item.work_id,
+                            "student_id": item.student_id,
+                            "student_name": item.student_name,
+                            "position": item.position,
+                            "status": item.status,
+                            "queued_at": item.queued_at.isoformat(),
+                            "started_at": item.started_at.isoformat() if item.started_at else None,
+                            "completed_at": item.completed_at.isoformat() if item.completed_at else None,
+                            "error": item.error
+                        }
+                        for item in queue[-20:]  # Последние 20
+                    ]
                 },
                 "timestamp": datetime.utcnow().isoformat()
             }
 
             await self.broadcast_to_class(class_id, status_message)
 
+    def get_avg_processing_time(self, class_id: int) -> float:
+        """Среднее время обработки (секунды)"""
+        if class_id not in self.processing_stats or not self.processing_stats[class_id]:
+            return 6.0  # По умолчанию 6 секунд
+
+        stats = self.processing_stats[class_id][-50:]  # Последние 50
+        return sum(stats) / len(stats) if stats else 6.0
+
     async def process_queue(self, class_id: int):
-        """Фоновая задача для обработки очереди работ"""
+        """Фоновая задача для обработки очереди"""
+        client = get_ocr_client_v1()
+
         while True:
             try:
-                # Ждем новую работу в очереди
-                work_data = await self.class_queues[class_id].get()
+                # Ищем следующий элемент для обработки
+                next_item = None
+                async with self.queue_locks[class_id]:
+                    for item in self.class_queues[class_id]:
+                        if item.status == "queued":
+                            next_item = item
+                            item.status = "processing"
+                            item.started_at = datetime.utcnow()
+                            break
+
+                if not next_item:
+                    # Нет элементов в очереди - ждем
+                    await asyncio.sleep(1)
+                    continue
 
                 # Уведомляем о начале обработки
                 await self.broadcast_to_class(class_id, {
                     "type": "work_started",
                     "data": {
-                        "work_id": work_data["work_id"],
-                        "student_name": work_data["student_name"],
-                        "position": work_data["position"]
+                        "work_id": next_item.work_id,
+                        "student_id": next_item.student_id,
+                        "student_name": next_item.student_name,
+                        "position": next_item.position
                     },
                     "timestamp": datetime.utcnow().isoformat()
                 })
 
-                # Эмулируем обработку (в реальности здесь будет вызов ML API)
-                # Вместо эмуляции нужно использовать реальную обработку
-                await asyncio.sleep(2)  # Симуляция обработки
+                # Обрабатываем
+                start_time = time.time()
+                try:
+                    result = client.assess_solution(
+                        image_bytes=next_item.image_bytes,
+                        filename=next_item.filename,
+                        reference_answer=next_item.reference_answer,
+                        reference_formulas=next_item.reference_formulas
+                    )
 
-                # Получаем результат (в реальности из ML API)
-                result = await self.process_work(work_data)
+                    processing_time = time.time() - start_time
 
-                # Отправляем результат
-                await self.broadcast_to_class(class_id, {
-                    "type": "work_completed",
-                    "data": {
-                        "work_id": work_data["work_id"],
-                        "student_name": work_data["student_name"],
-                        "result": result,
-                        "check_level": result.get("check_level", "level_3"),
-                        "confidence_score": result.get("confidence_score", 0)
-                    },
-                    "timestamp": datetime.utcnow().isoformat()
-                })
+                    # Сохраняем статистику
+                    self.processing_stats[class_id].append(processing_time)
 
-                # Обновляем позиции в очереди
-                await self.update_queue_positions(class_id)
+                    if result.get("success"):
+                        next_item.status = "completed"
+                        next_item.result = result.get("assessment", {})
+                        next_item.completed_at = datetime.utcnow()
+
+                        # Отправляем результат
+                        assessment = result.get("assessment", {})
+                        await self.broadcast_to_class(class_id, {
+                            "type": "work_completed",
+                            "data": {
+                                "work_id": next_item.work_id,
+                                "student_id": next_item.student_id,
+                                "student_name": next_item.student_name,
+                                "confidence_score": assessment.get("confidence_score"),
+                                "check_level": f"level_{assessment.get('confidence_level', 3)}",
+                                "mark_score": assessment.get("mark_score"),
+                                "teacher_comment": assessment.get("teacher_comment")
+                            },
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                    else:
+                        next_item.status = "failed"
+                        next_item.error = result.get("error", "Unknown error")
+                        next_item.completed_at = datetime.utcnow()
+
+                        await self.broadcast_to_class(class_id, {
+                            "type": "work_failed",
+                            "data": {
+                                "work_id": next_item.work_id,
+                                "student_id": next_item.student_id,
+                                "student_name": next_item.student_name,
+                                "error": next_item.error
+                            },
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+
+                except Exception as e:
+                    logger.error(f"Error processing work {next_item.work_id}: {e}")
+                    next_item.status = "failed"
+                    next_item.error = str(e)
+                    next_item.completed_at = datetime.utcnow()
+
+                    await self.broadcast_to_class(class_id, {
+                        "type": "work_failed",
+                        "data": {
+                            "work_id": next_item.work_id,
+                            "student_id": next_item.student_id,
+                            "student_name": next_item.student_name,
+                            "error": str(e)
+                        },
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+
+                # Обновляем статус очереди
+                await self.send_queue_status(class_id)
+
+                # Очищаем старые завершенные элементы (опционально)
+                await self.cleanup_completed_items(class_id)
 
             except asyncio.CancelledError:
                 logger.info(f"Queue processing for class {class_id} cancelled")
                 break
             except Exception as e:
-                logger.error(f"Error processing queue for class {class_id}: {e}")
-                await asyncio.sleep(1)
+                logger.error(f"Error in queue processing for class {class_id}: {e}")
+                await asyncio.sleep(5)
 
-    async def process_work(self, work_data: dict) -> dict:
-        """Реальная обработка работы через ML API"""
-        # Здесь должен быть вызов реального ML API
-        # Используем существующий ocr_client_v1
-        from ..ocr_client import get_ocr_client_v1
+    async def cleanup_completed_items(self, class_id: int):
+        """Очистка старых завершенных элементов"""
+        async with self.queue_locks[class_id]:
+            # Оставляем только:
+            # - элементы в очереди (queued, processing)
+            # - завершенные за последние 5 минут
+            cutoff = datetime.utcnow() - timedelta(minutes=5)
+            self.class_queues[class_id] = [
+                item for item in self.class_queues[class_id]
+                if item.status in ["queued", "processing"] or
+                   (item.completed_at and item.completed_at > cutoff)
+            ]
 
-        client = get_ocr_client_v1()
-
-        try:
-            result = client.assess_solution(
-                image_bytes=work_data["image_bytes"],
-                filename=work_data["filename"],
-                reference_answer=work_data.get("reference_answer"),
-                reference_formulas=work_data.get("reference_formulas")
-            )
-
-            if result.get("success"):
-                assessment = result.get("assessment", {})
-                return {
-                    "success": True,
-                    "confidence_score": assessment.get("confidence_score"),
-                    "check_level": f"level_{assessment.get('confidence_level', 3)}",
-                    "mark_score": assessment.get("mark_score"),
-                    "teacher_comment": assessment.get("teacher_comment"),
-                    "steps_analysis": assessment.get("steps_analysis", [])
-                }
-            else:
-                return {
-                    "success": False,
-                    "error": result.get("error", "Unknown error")
-                }
-        except Exception as e:
-            logger.error(f"Error processing work: {e}")
+    async def get_queue_status(self, class_id: int) -> dict:
+        """Получить полный статус очереди"""
+        if class_id not in self.class_queues:
             return {
-                "success": False,
-                "error": str(e)
+                "queue_size": 0,
+                "processing": 0,
+                "completed": 0,
+                "failed": 0,
+                "items": [],
+                "estimated_wait_seconds": 0,
+                "avg_processing_time": 6.0
             }
 
-    async def update_queue_positions(self, class_id: int):
-        """Обновить позиции в очереди после завершения работы"""
-        if class_id in self.class_queues:
-            # Создаем временный список для обновления позиций
-            temp_queue = []
-            while not self.class_queues[class_id].empty():
-                item = await self.class_queues[class_id].get()
-                temp_queue.append(item)
+        async with self.queue_locks[class_id]:
+            queue = self.class_queues[class_id]
+            queued = [q for q in queue if q.status == "queued"]
+            processing = [q for q in queue if q.status == "processing"]
+            completed = [q for q in queue if q.status == "completed"]
+            failed = [q for q in queue if q.status == "failed"]
 
-            # Возвращаем в очередь с обновленными позициями
-            for i, item in enumerate(temp_queue, 1):
-                item["position"] = i
-                await self.class_queues[class_id].put(item)
+            avg_time = self.get_avg_processing_time(class_id)
+            estimated_wait = len(queued) * avg_time
 
-            # Отправляем обновленный статус
-            await self.send_queue_status(class_id)
+            return {
+                "queue_size": len(queue),
+                "queued": len(queued),
+                "processing": len(processing),
+                "completed": len(completed),
+                "failed": len(failed),
+                "estimated_wait_seconds": int(estimated_wait),
+                "avg_processing_time": round(avg_time, 1),
+                "items": [
+                    {
+                        "work_id": item.work_id,
+                        "student_id": item.student_id,
+                        "student_name": item.student_name,
+                        "position": item.position,
+                        "status": item.status,
+                        "queued_at": item.queued_at.isoformat(),
+                        "started_at": item.started_at.isoformat() if item.started_at else None,
+                        "completed_at": item.completed_at.isoformat() if item.completed_at else None,
+                        "error": item.error
+                    }
+                    for item in queue
+                ]
+            }
 
 
+# Создаем глобальный менеджер
 manager = ConnectionManager()
+
+
+# Запускаем heartbeat при старте
+@router.on_event("startup")
+async def start_heartbeat():
+    asyncio.create_task(manager.start_heartbeat())
 
 
 async def get_current_user_ws(token: str, session: Session) -> Optional[User]:
@@ -253,15 +438,27 @@ async def websocket_class(
             data = await websocket.receive_text()
             message = json.loads(data)
 
-            if message.get("type") == "ping":
-                await websocket.send_json({"type": "pong"})
+            if message.get("type") == "get_queue_status":
+                status = await manager.get_queue_status(class_id)
+                await websocket.send_json({
+                    "type": "queue_status",
+                    "data": status,
+                    "timestamp": datetime.utcnow().isoformat()
+                })
 
-            elif message.get("type") == "get_queue_status":
-                await manager.send_queue_status(class_id)
-
-            elif message.get("type") == "cancel_work":
-                # TODO: Реализовать отмену работы в очереди
-                pass
+            elif message.get("type") == "get_work_result":
+                work_id = message.get("work_id")
+                # Ищем результат в очереди
+                for item in manager.class_queues.get(class_id, []):
+                    if item.work_id == work_id and item.status == "completed":
+                        await websocket.send_json({
+                            "type": "work_result",
+                            "data": {
+                                "work_id": work_id,
+                                "result": item.result
+                            }
+                        })
+                        break
 
     except WebSocketDisconnect:
         manager.disconnect(websocket, class_id)
@@ -271,23 +468,48 @@ async def websocket_class(
         manager.disconnect(websocket, class_id)
 
 
-# API для добавления работ в очередь
-async def add_work_to_queue(
+# API функция для добавления работ в очередь
+async def add_works_to_queue(
         class_id: int,
-        work_id: int,
-        student_name: str,
-        image_bytes: bytes,
-        filename: str,
-        reference_answer: Optional[str] = None,
-        reference_formulas: Optional[list] = None
+        works: List[dict],
+        session: Session
 ) -> int:
-    """Добавить работу в очередь на обработку (вызывается из основного API)"""
-    position = await manager.add_to_queue(class_id, {
-        "work_id": work_id,
-        "student_name": student_name,
-        "image_bytes": image_bytes,
-        "filename": filename,
-        "reference_answer": reference_answer,
-        "reference_formulas": reference_formulas
-    })
+    """
+    Добавить несколько работ в очередь на обработку
+
+    Args:
+        class_id: ID класса
+        works: список словарей с полями:
+            - work_id: int
+            - student_id: int
+            - student_name: str
+            - image_bytes: bytes
+            - filename: str
+            - reference_answer: Optional[str]
+            - reference_formulas: Optional[list]
+        session: сессия БД
+
+    Returns:
+        int: позиция первого элемента в очереди
+    """
+    items = []
+    for work in works:
+        item = QueueItem(
+            work_id=work["work_id"],
+            student_id=work["student_id"],
+            student_name=work["student_name"],
+            image_bytes=work["image_bytes"],
+            filename=work["filename"],
+            reference_answer=work.get("reference_answer"),
+            reference_formulas=work.get("reference_formulas")
+        )
+        items.append(item)
+
+    position = await manager.add_to_queue(class_id, items)
+
+    # Сохраняем в БД статус queued
+    for work in works:
+        from ..crud.assessment import update_image_status
+        update_image_status(session, work["work_id"], "queued")
+
     return position
