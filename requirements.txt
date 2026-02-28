@@ -12,6 +12,7 @@ email-validator==2.1.0
 bcrypt==4.0.1  # Используем стабильную версию
 aiofiles==23.2.1
 requests==2.31.0
+websockets
 
 # БАЗА ДАННЫХ
 psycopg2-binary==2.9.9

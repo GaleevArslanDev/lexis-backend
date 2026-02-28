@@ -11,9 +11,11 @@ from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Backgro
 from fastapi.responses import JSONResponse
 from sqlmodel import Session, select
 
+from .assessit_ws import manager
 from ..db import get_session
 from ..dependencies.auth import get_current_user
 from ..dependencies_util import require_role
+from ..exceptions import AppException, ErrorCode
 from ..models import User, AssessmentImage, Assignment, Class, ClassStudentLink, RecognizedSolution
 from ..crud.assessment import (
     create_assessment_image,
@@ -24,7 +26,8 @@ from ..crud.assessment import (
     get_class_assessment_summary,
     get_teacher_dashboard_stats,
     update_image_status,
-    create_recognized_solution_v1,  # Новый метод
+    create_recognized_solution_v1, create_teacher_verification, get_common_mistakes,
+    get_class_assessments_paginated,  # Новый метод
 )
 from ..ocr_client import get_ocr_client_v1  # Новый клиент
 from ..schemas import (
@@ -54,13 +57,16 @@ async def upload_student_work(
         student_id: Optional[int] = None,
         class_id: Optional[int] = None,
         file: UploadFile = File(...),
-        background_tasks: BackgroundTasks = None,
+        wait_for_result: bool = Query(False, description="Ждать результата или добавить в очередь"),
         session: Session = Depends(get_session),
         current_user: User = Depends(get_current_user)
 ):
     """
     Загрузить работу ученика для проверки
-    
+
+    - Если wait_for_result=False (по умолчанию) - работа добавляется в очередь,
+      результат будет отправлен через WebSocket
+    - Если wait_for_result=True - ожидаем результат синхронно (может занять 5-7 секунд)
     - Если student_id не указан, используется ID текущего пользователя (для учеников)
     - Если указан student_id, текущий пользователь должен быть учителем этого класса
     """
@@ -96,7 +102,12 @@ async def upload_student_work(
         # Получаем задание для эталонных данных
         assignment = session.get(Assignment, assignment_id)
         if not assignment:
-            raise HTTPException(status_code=404, detail="Assignment not found")
+            raise AppException(
+                status_code=404,
+                error_code=ErrorCode.NOT_FOUND,
+                message="Assignment not found",
+                details={"assignment_id": assignment_id}
+            )
 
         # Создаем запись в БД
         image = create_assessment_image(
@@ -106,62 +117,300 @@ async def upload_student_work(
             file_name=file.filename,
             file_size=len(file_content),
             mime_type=file.content_type or "application/octet-stream",
-            class_id=class_id
+            class_id=class_id or assignment.class_id
         )
 
-        # Получаем эталонные данные из задания
-        reference_answer = assignment.reference_answer
-        reference_formulas = None
-        if assignment.reference_solution:
-            # Можно извлечь формулы из решения, пока просто передаем как есть
-            reference_formulas = [assignment.reference_solution]
+        if not wait_for_result and class_id:
+            student = session.get(User, target_student_id)
+            student_name = f"{student.name} {student.surname}" if student else "Unknown"
 
-        # Отправляем в OCR API v1
-        logger.info(f"Sending image {image.id} to OCR API v1 for assessment")
-        
-        ocr_result = ocr_client_v1.assess_solution(
-            image_bytes=file_content,
-            filename=file.filename,
-            reference_answer=reference_answer,
-            reference_formulas=reference_formulas
-        )
-
-        if not ocr_result.get("success", False):
-            error_msg = ocr_result.get("error", "Unknown OCR error")
-            update_image_status(session, image.id, "error", error_msg)
-            logger.error(f"OCR failed for image {image.id}: {error_msg}")
-            
-            return UploadWorkResponse(
+            position = await add_work_to_queue(
+                class_id=class_id or assignment.class_id,
                 work_id=image.id,
-                message="Work uploaded but OCR failed",
-                error=error_msg
+                student_name=student_name,
+                image_bytes=file_content,
+                filename=file.filename,
+                reference_answer=assignment.reference_answer,
+                reference_formulas=[assignment.reference_solution] if assignment.reference_solution else None
             )
 
-        # Сохраняем результаты
-        assessment_data = ocr_result.get("assessment", {})
-        solution = create_recognized_solution_v1(session, image.id, assessment_data)
-        
-        update_image_status(session, image.id, "processed")
-        
-        logger.info(f"Successfully processed image {image.id} with confidence {assessment_data.get('confidence_score', 0)}")
+            return UploadWorkResponse(
+                work_id=image.id,
+                message=f"Work added to queue at position {position}",
+                queue_position=position,
+                status="queued"
+            )
 
-        # Очистка памяти
-        del file_content
-        gc.collect()
+            # Иначе обрабатываем синхронно
+            try:
+                ocr_result = ocr_client_v1.assess_solution(
+                    image_bytes=file_content,
+                    filename=file.filename,
+                    reference_answer=assignment.reference_answer,
+                    reference_formulas=[assignment.reference_solution] if assignment.reference_solution else None
+                )
+            except Exception as e:
+                # Конвертируем ошибку в AppException
+                update_image_status(session, image.id, "error", str(e))
+                raise handle_ocr_error(e, image.id)
 
-        return UploadWorkResponse(
-            work_id=image.id,
-            message="Work uploaded and processed successfully",
-            confidence_score=assessment_data.get("confidence_score"),
-            check_level=f"level_{assessment_data.get('confidence_level', 3)}"
-        )
+            if not ocr_result.get("success", False):
+                error_msg = ocr_result.get("error", "Unknown OCR error")
+                update_image_status(session, image.id, "error", error_msg)
 
-    except HTTPException:
+                raise AppException(
+                    status_code=502,
+                    error_code=ErrorCode.OCR_API_ERROR,
+                    message=error_msg,
+                    details={"image_id": image.id}
+                )
+
+            # Сохраняем результаты
+            assessment_data = ocr_result.get("assessment", {})
+            solution = create_recognized_solution_v1(session, image.id, assessment_data)
+            update_image_status(session, image.id, "processed")
+
+            return UploadWorkResponse(
+                work_id=image.id,
+                message="Work processed successfully",
+                confidence_score=assessment_data.get("confidence_score"),
+                check_level=f"level_{assessment_data.get('confidence_level', 3)}",
+                solution_id=assessment_data.get("solution_id")
+            )
+
+    except AppException:
         raise
     except Exception as e:
         logger.error(f"Upload error: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+        raise AppException(
+            status_code=500,
+            error_code=ErrorCode.INTERNAL_ERROR,
+            message="Upload failed",
+            details={"error": str(e)}
+        )
 
+
+@router.get("/dashboard/{teacher_id}", response_model=DashboardStats)
+async def get_dashboard(
+        teacher_id: int,
+        days: int = Query(30, ge=1, le=90),
+        session: Session = Depends(get_session),
+        current_user: User = Depends(require_role("teacher"))
+):
+    """Главный экран - дашборд учителя с графиками (Рис. 2, 6)"""
+
+    # Проверяем права (учитель может смотреть только свой дашборд)
+    if current_user.id != teacher_id and current_user.role != "admin":
+        raise AppException(
+            status_code=403,
+            error_code=ErrorCode.ACCESS_DENIED,
+            message="You can only view your own dashboard",
+            details={"teacher_id": teacher_id, "current_user": current_user.id}
+        )
+
+    stats = get_teacher_dashboard_stats(session, teacher_id, days)
+    return stats
+
+
+@router.get("/class/{class_id}/summary", response_model=ClassAssessmentSummary)
+async def get_class_summary(
+        class_id: int,
+        assignment_id: Optional[int] = None,
+        session: Session = Depends(get_session),
+        current_user: User = Depends(require_role("teacher"))
+):
+    """Сводка по классу для экрана результатов (Рис. 5)"""
+
+    # Проверяем права
+    class_obj = session.get(Class, class_id)
+    if not class_obj:
+        raise AppException(
+            status_code=404,
+            error_code=ErrorCode.NOT_FOUND,
+            message="Class not found",
+            details={"class_id": class_id}
+        )
+
+    if class_obj.teacher_id != current_user.id:
+        raise AppException(
+            status_code=403,
+            error_code=ErrorCode.ACCESS_DENIED,
+            message="Not your class",
+            details={"class_id": class_id}
+        )
+
+    summary = get_class_assessment_summary(session, class_id, assignment_id)
+    return summary
+
+
+@router.get("/class/{class_id}/works", response_model=dict)
+async def get_class_works(
+        class_id: int,
+        assignment_id: Optional[int] = None,
+        status: Optional[str] = Query(None, regex="^(pending|processing|processed|error)$"),
+        check_level: Optional[str] = Query(None, regex="^(level_1|level_2|level_3)$"),
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=100),
+        session: Session = Depends(get_session),
+        current_user: User = Depends(require_role("teacher"))
+):
+    """Список работ класса с пагинацией и фильтрацией (для экрана результатов)"""
+
+    # Проверяем права
+    class_obj = session.get(Class, class_id)
+    if not class_obj or class_obj.teacher_id != current_user.id:
+        raise AppException(
+            status_code=403,
+            error_code=ErrorCode.ACCESS_DENIED,
+            message="Not your class",
+            details={"class_id": class_id}
+        )
+
+    result = get_class_assessments_paginated(
+        session, class_id, assignment_id, status, check_level,
+        page, page_size
+    )
+
+    # Добавляем статус очереди из WebSocket
+    if class_id in manager.class_queues:
+        queue_size = manager.class_queues[class_id].qsize()
+        result["queue_status"] = {
+            "size": queue_size,
+            "estimated_wait_seconds": queue_size * 6  # 6 секунд на работу
+        }
+
+    return result
+
+
+@router.get("/class/{class_id}/common-mistakes", response_model=List[CommonError])
+async def get_class_common_mistakes(
+        class_id: int,
+        assignment_id: Optional[int] = None,
+        limit: int = Query(10, ge=1, le=50),
+        session: Session = Depends(get_session),
+        current_user: User = Depends(require_role("teacher"))
+):
+    """Типичные ошибки класса для аналитики (Рис. 6)"""
+
+    # Проверяем права
+    class_obj = session.get(Class, class_id)
+    if not class_obj or class_obj.teacher_id != current_user.id:
+        raise AppException(
+            status_code=403,
+            error_code=ErrorCode.ACCESS_DENIED,
+            message="Not your class",
+            details={"class_id": class_id}
+        )
+
+    mistakes = get_common_mistakes(session, class_id, assignment_id, limit)
+    return mistakes
+
+
+@router.post("/work/{work_id}/verify", response_model=TeacherVerificationResponse)
+async def verify_work(
+        work_id: int,
+        verification: TeacherVerificationRequest,
+        session: Session = Depends(get_session),
+        current_user: User = Depends(require_role("teacher"))
+):
+    """Подтверждение/корректировка работы учителем (кнопки действий на Рис. 5)"""
+
+    # Получаем работу
+    image = get_assessment_image(session, work_id)
+    if not image:
+        raise AppException(
+            status_code=404,
+            error_code=ErrorCode.NOT_FOUND,
+            message="Work not found",
+            details={"work_id": work_id}
+        )
+
+    # Проверяем права
+    class_obj = session.get(Class, image.class_id)
+    if not class_obj or class_obj.teacher_id != current_user.id:
+        raise AppException(
+            status_code=403,
+            error_code=ErrorCode.ACCESS_DENIED,
+            message="Not your class",
+            details={"work_id": work_id, "class_id": image.class_id}
+        )
+
+    # Получаем решение
+    solution = get_recognized_solution(session, work_id)
+    if not solution:
+        raise AppException(
+            status_code=404,
+            error_code=ErrorCode.NOT_FOUND,
+            message="Solution not found for this work",
+            details={"work_id": work_id}
+        )
+
+    # Создаем результат проверки
+    result = create_teacher_verification(
+        session=session,
+        solution_id=solution.id,
+        teacher_id=current_user.id,
+        verdict=verification.verdict,
+        score=verification.score,
+        feedback=verification.feedback,
+        corrected_text=verification.corrected_text,
+        corrected_answer=verification.corrected_answer
+    )
+
+    # Уведомляем через WebSocket (если кто-то подключен)
+    await manager.broadcast_to_class(image.class_id, {
+        "type": "work_verified",
+        "data": {
+            "work_id": work_id,
+            "verdict": verification.verdict,
+            "score": verification.score
+        },
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return TeacherVerificationResponse(
+        result_id=result.id,
+        work_id=work_id,
+        teacher_id=current_user.id,
+        verdict=verification.verdict,
+        score=verification.score,
+        feedback=verification.feedback,
+        verified_at=result.verified_at or datetime.utcnow()
+    )
+
+
+@router.get("/queue/{class_id}/status")
+async def get_queue_status(
+        class_id: int,
+        session: Session = Depends(get_session),
+        current_user: User = Depends(require_role("teacher"))
+):
+    """Получить статус очереди для класса"""
+
+    # Проверяем права
+    class_obj = session.get(Class, class_id)
+    if not class_obj or class_obj.teacher_id != current_user.id:
+        raise AppException(
+            status_code=403,
+            error_code=ErrorCode.ACCESS_DENIED,
+            message="Not your class",
+            details={"class_id": class_id}
+        )
+
+    if class_id not in manager.class_queues:
+        return {
+            "queue_size": 0,
+            "estimated_wait_seconds": 0,
+            "status": "idle"
+        }
+
+    queue_size = manager.class_queues[class_id].qsize()
+    return {
+        "queue_size": queue_size,
+        "estimated_wait_seconds": queue_size * 6,
+        "estimated_wait_minutes": round(queue_size * 6 / 60, 1),
+        "status": "processing" if queue_size > 0 else "idle"
+    }
 
 @router.post("/batch-upload", response_model=BatchUploadResponse)
 async def batch_upload_works(

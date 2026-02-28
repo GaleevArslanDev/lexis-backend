@@ -1,14 +1,56 @@
+from http.client import HTTPException
 from fastapi import FastAPI
-from .routers import auth, classes, assignments, files, ai, schools, reports, logs, users, assessit
+from .exceptions import ErrorCode, AppException, logger
+from .routers import auth, classes, assignments, files, ai, schools, reports, logs, users, assessit, assessit_ws
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import gc
 import os
 
+def add_exception_handlers(app):
+    @app.exception_handler(AppException)
+    async def app_exception_handler(request, exc: AppException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=exc.detail
+        )
+
+    @app.exception_handler(HTTPException)
+    async def http_exception_handler(request, exc: HTTPException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "success": False,
+                "error": {
+                    "code": ErrorCode.INTERNAL_ERROR,
+                    "message": exc.detail,
+                    "details": {}
+                }
+            }
+        )
+
+    @app.exception_handler(Exception)
+    async def generic_exception_handler(request, exc: Exception):
+        logger.error(f"Unhandled exception: {exc}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "error": {
+                    "code": ErrorCode.INTERNAL_ERROR,
+                    "message": "Internal server error",
+                    "details": {"error": str(exc)}
+                }
+            }
+        )
+
 app = FastAPI(
-    title="Лексис - backend",
+    title="AssessIt - backend",
     description="Образовательная платформа с системой автоматической проверки работ AssessIt",
     version="2.0.0"
 )
+
+add_exception_handlers(app)
 
 # CORS
 app.add_middleware(
@@ -31,7 +73,8 @@ app.include_router(schools.router)
 app.include_router(reports.router)
 app.include_router(logs.router)
 app.include_router(users.router)
-app.include_router(assessit.router)  # Новый роутер для AssessIt
+app.include_router(assessit.router)
+app.include_router(assessit_ws.router)
 
 
 @app.on_event("startup")

@@ -156,8 +156,10 @@ class UploadWorkResponse(BaseModel):
     error: Optional[str] = None
     confidence_score: Optional[float] = None
     check_level: Optional[str] = None
-    solution_id: Optional[str] = None  # UUID из ML API
-    
+    solution_id: Optional[str] = None
+    queue_position: Optional[int] = None
+    status: str = "processed"  # processed, queued, error
+
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -352,5 +354,37 @@ class CommonError(BaseModel):
     count: int
     percentage: float
     examples: List[str]
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class PaginationInfo(BaseModel):
+    page: int
+    page_size: int
+    total: int
+    total_pages: int
+    has_next: bool
+    has_prev: bool
+
+
+class PaginatedResponse(BaseModel):
+    items: List[Any]
+    pagination: PaginationInfo
+
+
+class QueueStatusResponse(BaseModel):
+    queue_size: int
+    estimated_wait_seconds: int
+    estimated_wait_minutes: Optional[float] = None
+    status: str = "idle"  # idle, processing
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class WorkVerifiedResponse(BaseModel):
+    work_id: int
+    verdict: str
+    score: Optional[float]
+    verified_at: datetime
 
     model_config = ConfigDict(from_attributes=True)

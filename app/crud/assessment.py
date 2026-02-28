@@ -419,3 +419,267 @@ def get_teacher_dashboard_stats(
         "accuracy_rate": round(processed_count / total_works * 100, 1) if total_works > 0 else 0,
         "daily_stats": daily_stats_list
     }
+
+
+def get_class_assessments_paginated(
+        session: Session,
+        class_id: int,
+        assignment_id: Optional[int] = None,
+        status: Optional[str] = None,
+        check_level: Optional[str] = None,
+        page: int = 1,
+        page_size: int = 20
+) -> Dict[str, Any]:
+    """Получить работы класса с пагинацией"""
+
+    # Базовый запрос
+    query = select(AssessmentImage).where(AssessmentImage.class_id == class_id)
+
+    if assignment_id:
+        query = query.where(AssessmentImage.assignment_id == assignment_id)
+
+    if status:
+        query = query.where(AssessmentImage.status == status)
+
+    # Сначала считаем общее количество
+    count_query = select(func.count()).select_from(query.subquery())
+    total = session.exec(count_query).one()
+
+    # Добавляем сортировку и пагинацию
+    query = query.order_by(desc(AssessmentImage.upload_time))
+    query = query.offset((page - 1) * page_size).limit(page_size)
+
+    works = session.exec(query).all()
+
+    # Обогащаем данными о студентах и решениях
+    result = []
+    for work in works:
+        student = session.get(User, work.student_id)
+        solution = get_recognized_solution(session, work.id)
+
+        result.append({
+            "work_id": work.id,
+            "student_id": work.student_id,
+            "student_name": student.name if student else "Unknown",
+            "student_surname": student.surname if student else "",
+            "status": work.status,
+            "check_level": solution.check_level if solution else None,
+            "confidence_score": solution.total_confidence if solution else None,
+            "teacher_score": None,  # Заполняется из AssessmentResult
+            "system_score": solution.suggested_grade if solution else None,
+            "uploaded_at": work.upload_time,
+            "processed_at": solution.recognized_at if solution else None
+        })
+
+    return {
+        "items": result,
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": (total + page_size - 1) // page_size,
+            "has_next": page * page_size < total,
+            "has_prev": page > 1
+        }
+    }
+
+
+def get_common_mistakes(
+        session: Session,
+        class_id: int,
+        assignment_id: Optional[int] = None,
+        limit: int = 10
+) -> List[Dict[str, Any]]:
+    """Анализ типичных ошибок класса"""
+
+    # Получаем все решения для класса
+    query = (
+        select(RecognizedSolution)
+        .join(AssessmentImage)
+        .where(AssessmentImage.class_id == class_id)
+    )
+
+    if assignment_id:
+        query = query.where(AssessmentImage.assignment_id == assignment_id)
+
+    solutions = session.exec(query).all()
+
+    mistakes = {}
+    examples = {}
+
+    for sol in solutions:
+        if sol.steps_analysis_json:
+            steps = json.loads(sol.steps_analysis_json)
+            for step in steps:
+                if not step.get("is_correct", True):
+                    mistake_type = step.get("expected_formula", "unknown")
+                    found = step.get("found_formula", "")
+
+                    if mistake_type not in mistakes:
+                        mistakes[mistake_type] = 0
+                        examples[mistake_type] = []
+
+                    mistakes[mistake_type] += 1
+
+                    # Сохраняем примеры (не больше 3)
+                    if len(examples[mistake_type]) < 3 and found:
+                        examples[mistake_type].append(found)
+
+    # Сортируем по частоте
+    sorted_mistakes = sorted(mistakes.items(), key=lambda x: x[1], reverse=True)[:limit]
+    total = sum(mistakes.values()) or 1  # избегаем деления на 0
+
+    result = []
+    for mistake_type, count in sorted_mistakes:
+        result.append({
+            "error_type": mistake_type,
+            "count": count,
+            "percentage": round((count / total) * 100, 1),
+            "examples": examples.get(mistake_type, [])
+        })
+
+    return result
+
+
+def get_teacher_dashboard_stats(
+        session: Session,
+        teacher_id: int,
+        days: int = 30
+) -> Dict[str, Any]:
+    """Получить статистику для дашборда учителя"""
+
+    cutoff_date = datetime.utcnow() - timedelta(days=days)
+
+    # Получаем классы учителя
+    classes = session.exec(select(Class).where(Class.teacher_id == teacher_id)).all()
+    class_ids = [c.id for c in classes]
+
+    if not class_ids:
+        return {
+            "total_assignments": 0,
+            "total_works_processed": 0,
+            "time_saved_hours": 0,
+            "avg_confidence": 0,
+            "accuracy_rate": 0,
+            "daily_stats": []
+        }
+
+    # Все работы за период
+    works = session.exec(
+        select(AssessmentImage)
+        .where(AssessmentImage.class_id.in_(class_ids))
+        .where(AssessmentImage.upload_time >= cutoff_date)
+    ).all()
+
+    # Все задания
+    assignments = session.exec(
+        select(Assignment)
+        .where(Assignment.class_id.in_(class_ids))
+    ).all()
+
+    # Обработанные работы
+    processed_works = [w for w in works if w.status == "processed"]
+
+    # Считаем confidence
+    confidences = []
+    for work in processed_works:
+        sol = get_recognized_solution(session, work.id)
+        if sol and sol.total_confidence:
+            confidences.append(sol.total_confidence)
+
+    avg_confidence = sum(confidences) / len(confidences) if confidences else 0
+
+    # Дневная статистика
+    daily = {}
+    for work in works:
+        day = work.upload_time.date().isoformat()
+        if day not in daily:
+            daily[day] = {"total": 0, "processed": 0, "errors": 0}
+
+        daily[day]["total"] += 1
+        if work.status == "processed":
+            daily[day]["processed"] += 1
+        elif work.status == "error":
+            daily[day]["errors"] += 1
+
+    daily_stats = [
+        {"date": day, **stats}
+        for day, stats in sorted(daily.items())
+    ]
+
+    # Экономия времени (3 минуты на работу)
+    time_saved_minutes = len(processed_works) * 3
+    time_saved_hours = time_saved_minutes / 60
+
+    # Точность (процент level_1)
+    level_1_count = 0
+    for work in processed_works:
+        sol = get_recognized_solution(session, work.id)
+        if sol and sol.check_level == "level_1":
+            level_1_count += 1
+
+    accuracy_rate = (level_1_count / len(processed_works) * 100) if processed_works else 0
+
+    return {
+        "total_assignments": len(assignments),
+        "total_works_processed": len(processed_works),
+        "time_saved_hours": round(time_saved_hours, 1),
+        "avg_confidence": round(avg_confidence, 2),
+        "accuracy_rate": round(accuracy_rate, 1),
+        "daily_stats": daily_stats
+    }
+
+
+def create_teacher_verification(
+        session: Session,
+        solution_id: int,
+        teacher_id: int,
+        verdict: str,
+        score: Optional[float] = None,
+        feedback: Optional[str] = None,
+        corrected_text: Optional[str] = None,
+        corrected_answer: Optional[str] = None
+) -> AssessmentResult:
+    """Создать результат проверки учителя"""
+
+    # Получаем решение
+    solution = session.get(RecognizedSolution, solution_id)
+    if not solution:
+        raise ValueError(f"Solution {solution_id} not found")
+
+    # Создаем результат
+    result = AssessmentResult(
+        solution_id=solution_id,
+        teacher_id=teacher_id,
+        teacher_verdict=verdict,
+        teacher_score=score,
+        teacher_feedback=feedback,
+        corrected_text=corrected_text,
+        corrected_answer=corrected_answer,
+        system_score=solution.suggested_grade,
+        system_feedback=solution.auto_feedback,
+        verified_at=datetime.utcnow()
+    )
+
+    session.add(result)
+    session.commit()
+    session.refresh(result)
+
+    # Если есть исправления, создаем обучающий пример
+    if corrected_text and corrected_text != solution.extracted_text:
+        # Получаем изображение
+        image = session.get(AssessmentImage, solution.image_id)
+        if image:
+            # Не сохраняем изображение, только метаданные
+            training_sample = TrainingSample(
+                image_path="",  # Не сохраняем файл
+                original_text=solution.extracted_text,
+                corrected_text=corrected_text,
+                subject=image.assignment.subject if image.assignment else None,
+                handwriting_style="unknown",
+                image_quality="unknown"
+            )
+            session.add(training_sample)
+            session.commit()
+
+    return result
