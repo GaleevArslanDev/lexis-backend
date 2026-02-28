@@ -154,11 +154,8 @@ class ConnectionManager:
             self.queue_locks[class_id] = asyncio.Lock()
             self.processing_stats[class_id] = []
 
-            # Запускаем обработчик очереди, если еще не запущен
-            if class_id not in self.processing_tasks:
-                self.processing_tasks[class_id] = asyncio.create_task(
-                    self.process_queue(class_id)
-                )
+        # ВАЖНО: Убеждаемся, что процессор запущен
+        await self.ensure_processor_running(class_id)
 
         async with self.queue_locks[class_id]:
             current_size = len(self.class_queues[class_id])
@@ -167,6 +164,7 @@ class ConnectionManager:
             for i, item in enumerate(items):
                 item.position = current_size + i + 1
                 self.class_queues[class_id].append(item)
+                logger.info(f"📝 Added work {item.work_id} to queue for class {class_id} at position {item.position}")
 
             # Обновляем статус очереди
             await self.send_queue_status(class_id)
@@ -250,6 +248,7 @@ class ConnectionManager:
 
     async def process_queue(self, class_id: int):
         """Фоновая задача для обработки очереди"""
+        logger.info(f"🔄 Queue processor started for class {class_id}")
         client = get_ocr_client_v1()
 
         while True:
@@ -258,6 +257,11 @@ class ConnectionManager:
                 if class_id not in self.class_queues:
                     logger.info(f"Queue for class {class_id} no longer exists, stopping processor")
                     break
+
+                # Логируем состояние очереди
+                queue_size = len(self.class_queues.get(class_id, []))
+                if queue_size > 0:
+                    logger.info(f"Class {class_id} queue size: {queue_size}")
 
                 # Ищем следующий элемент для обработки
                 next_item = None
@@ -274,6 +278,7 @@ class ConnectionManager:
                             next_item = item
                             item.status = "processing"
                             item.started_at = datetime.utcnow()
+                            logger.info(f"▶️ Processing work {item.work_id} for class {class_id}")
                             break
 
                 if not next_item:
@@ -296,6 +301,8 @@ class ConnectionManager:
                 # Обрабатываем
                 start_time = time.time()
                 try:
+                    logger.info(f"📤 Sending to OCR API: work {next_item.work_id}, file {next_item.filename}")
+
                     result = client.assess_solution(
                         image_bytes=next_item.image_bytes,
                         filename=next_item.filename,
@@ -304,6 +311,7 @@ class ConnectionManager:
                     )
 
                     processing_time = time.time() - start_time
+                    logger.info(f"✅ OCR API response received for work {next_item.work_id} in {processing_time:.2f}s")
 
                     # Сохраняем статистику
                     if class_id in self.processing_stats:
@@ -333,6 +341,7 @@ class ConnectionManager:
                         next_item.status = "failed"
                         next_item.error = result.get("error", "Unknown error")
                         next_item.completed_at = datetime.utcnow()
+                        logger.error(f"❌ OCR API error for work {next_item.work_id}: {next_item.error}")
 
                         await self.broadcast_to_class(class_id, {
                             "type": "work_failed",
@@ -346,7 +355,7 @@ class ConnectionManager:
                         })
 
                 except Exception as e:
-                    logger.error(f"Error processing work {next_item.work_id}: {e}")
+                    logger.error(f"🔥 Error processing work {next_item.work_id}: {e}", exc_info=True)
                     next_item.status = "failed"
                     next_item.error = str(e)
                     next_item.completed_at = datetime.utcnow()
@@ -369,11 +378,30 @@ class ConnectionManager:
                 await self.cleanup_completed_items(class_id)
 
             except asyncio.CancelledError:
-                logger.info(f"Queue processing for class {class_id} cancelled")
+                logger.info(f"🛑 Queue processing for class {class_id} cancelled")
                 break
             except Exception as e:
-                logger.error(f"Error in queue processing for class {class_id}: {e}")
+                logger.error(f"💥 Error in queue processing for class {class_id}: {e}", exc_info=True)
                 await asyncio.sleep(5)
+
+    async def ensure_processor_running(self, class_id: int):
+        """Гарантирует, что процессор очереди запущен"""
+        if class_id not in self.processing_tasks or self.processing_tasks[class_id].done():
+            if class_id in self.processing_tasks and self.processing_tasks[class_id].done():
+                # Если задача завершилась, удаляем её
+                try:
+                    self.processing_tasks[class_id].result()  # Может выбросить исключение
+                except Exception as e:
+                    logger.error(f"Processor for class {class_id} failed: {e}")
+                del self.processing_tasks[class_id]
+
+            # Запускаем новую
+            self.processing_tasks[class_id] = asyncio.create_task(
+                self.process_queue(class_id)
+            )
+            logger.info(f"🚀 (Re)started queue processor for class {class_id}")
+            return True
+        return False
 
     async def cleanup_completed_items(self, class_id: int):
         """Очистка старых завершенных элементов"""
@@ -541,6 +569,8 @@ async def add_works_to_queue(
     Returns:
         int: позиция первого элемента в очереди
     """
+    logger.info(f"📦 Adding {len(works)} works to queue for class {class_id}")
+
     items = []
     for work in works:
         item = QueueItem(
@@ -555,10 +585,12 @@ async def add_works_to_queue(
         items.append(item)
 
     position = await manager.add_to_queue(class_id, items)
+    logger.info(f"✅ Added {len(works)} works to queue for class {class_id}, first position: {position}")
 
     # Сохраняем в БД статус queued
     for work in works:
         from ..crud.assessment import update_image_status
         update_image_status(session, work["work_id"], "queued")
+        logger.info(f"💾 Updated DB: work {work['work_id']} status = queued")
 
     return position

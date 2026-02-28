@@ -274,6 +274,63 @@ async def get_queue_status(
     }
 
 
+@router.get("/debug/queue/{class_id}")
+async def debug_queue(
+        class_id: int,
+        session: Session = Depends(get_session),
+        current_user: User = Depends(require_role("teacher"))
+):
+    """Отладочный эндпоинт для проверки состояния очереди"""
+
+    # Проверяем права
+    class_obj = session.get(Class, class_id)
+    if not class_obj or class_obj.teacher_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not your class")
+
+    # Получаем статус из менеджера
+    queue_exists = class_id in manager.class_queues
+    processor_exists = class_id in manager.processing_tasks
+    processor_alive = processor_exists and not manager.processing_tasks[class_id].done()
+    lock_exists = class_id in manager.queue_locks
+
+    queue_size = len(manager.class_queues.get(class_id, [])) if queue_exists else 0
+
+    # Детальная информация о процессоре
+    processor_info = None
+    if processor_exists:
+        task = manager.processing_tasks[class_id]
+        processor_info = {
+            "done": task.done(),
+            "cancelled": task.cancelled(),
+            "exception": str(task.exception()) if task.done() and task.exception() else None
+        }
+
+    return {
+        "class_id": class_id,
+        "queue": {
+            "exists": queue_exists,
+            "size": queue_size
+        },
+        "processor": {
+            "exists": processor_exists,
+            "alive": processor_alive,
+            "info": processor_info
+        },
+        "lock_exists": lock_exists,
+        "items": [
+            {
+                "work_id": item.work_id,
+                "student_name": item.student_name,
+                "status": item.status,
+                "position": item.position,
+                "queued_at": item.queued_at.isoformat(),
+                "started_at": item.started_at.isoformat() if item.started_at else None
+            }
+            for item in manager.class_queues.get(class_id, [])
+        ] if queue_exists else []
+    }
+
+
 @router.post("/batch-upload", response_model=BatchUploadResponse)
 async def batch_upload_works(
         assignment_id: int = Form(...),
