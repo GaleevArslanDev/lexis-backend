@@ -419,6 +419,8 @@ async def batch_upload_works(
                     "work_id": image.id,
                     "student_id": student_id,
                     "student_name": student_names.get(student_id, "Unknown"),
+                    "assignment_id": assignment_id,
+                    "class_id": class_id,
                     "image_bytes": file_content,
                     "filename": file.filename,
                     "reference_answer": assignment.reference_answer,
