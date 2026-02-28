@@ -92,14 +92,19 @@ class ConnectionManager:
         # Добавляем в класс
         if class_id not in self.class_connections:
             self.class_connections[class_id] = set()
+
+        # Гарантируем, что структуры данных для очереди существуют
+        if class_id not in self.class_queues:
             self.class_queues[class_id] = []
             self.queue_locks[class_id] = asyncio.Lock()
             self.processing_stats[class_id] = []
 
             # Запускаем обработчик очереди
-            self.processing_tasks[class_id] = asyncio.create_task(
-                self.process_queue(class_id)
-            )
+            if class_id not in self.processing_tasks:
+                self.processing_tasks[class_id] = asyncio.create_task(
+                    self.process_queue(class_id)
+                )
+                logger.info(f"Started queue processor for class {class_id}")
 
         self.class_connections[class_id].add(websocket)
 
@@ -143,6 +148,18 @@ class ConnectionManager:
 
     async def add_to_queue(self, class_id: int, items: List[QueueItem]) -> int:
         """Добавить несколько работ в очередь"""
+        # Гарантируем, что очередь инициализирована
+        if class_id not in self.class_queues:
+            self.class_queues[class_id] = []
+            self.queue_locks[class_id] = asyncio.Lock()
+            self.processing_stats[class_id] = []
+
+            # Запускаем обработчик очереди, если еще не запущен
+            if class_id not in self.processing_tasks:
+                self.processing_tasks[class_id] = asyncio.create_task(
+                    self.process_queue(class_id)
+                )
+
         async with self.queue_locks[class_id]:
             current_size = len(self.class_queues[class_id])
 
@@ -159,9 +176,26 @@ class ConnectionManager:
     async def send_queue_status(self, class_id: int):
         """Отправить детальный статус очереди"""
         if class_id not in self.class_queues:
+            # Если очереди нет, отправляем пустой статус
+            status_message = {
+                "type": "queue_status",
+                "data": {
+                    "queue_size": 0,
+                    "queued": 0,
+                    "processing": 0,
+                    "completed": 0,
+                    "failed": 0,
+                    "estimated_wait_seconds": 0,
+                    "estimated_wait_minutes": 0,
+                    "avg_processing_time": 6.0,
+                    "items": []
+                },
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            await self.broadcast_to_class(class_id, status_message)
             return
 
-        async with self.queue_locks[class_id]:
+        async with self.queue_locks.get(class_id, asyncio.Lock()):
             queue = self.class_queues[class_id]
 
             # Считаем статистику
@@ -183,7 +217,7 @@ class ConnectionManager:
                     "processing": len(processing),
                     "completed": len(completed),
                     "failed": len(failed),
-                    "estimated_wait_seconds": estimated_wait,
+                    "estimated_wait_seconds": int(estimated_wait),
                     "estimated_wait_minutes": round(estimated_wait / 60, 1),
                     "avg_processing_time": round(avg_time, 1),
                     "items": [
@@ -220,10 +254,22 @@ class ConnectionManager:
 
         while True:
             try:
+                # Проверяем, существует ли еще очередь
+                if class_id not in self.class_queues:
+                    logger.info(f"Queue for class {class_id} no longer exists, stopping processor")
+                    break
+
                 # Ищем следующий элемент для обработки
                 next_item = None
-                async with self.queue_locks[class_id]:
-                    for item in self.class_queues[class_id]:
+                lock = self.queue_locks.get(class_id)
+                if not lock:
+                    logger.error(f"Lock for class {class_id} not found")
+                    await asyncio.sleep(1)
+                    continue
+
+                async with lock:
+                    queue = self.class_queues.get(class_id, [])
+                    for item in queue:
                         if item.status == "queued":
                             next_item = item
                             item.status = "processing"
@@ -260,7 +306,8 @@ class ConnectionManager:
                     processing_time = time.time() - start_time
 
                     # Сохраняем статистику
-                    self.processing_stats[class_id].append(processing_time)
+                    if class_id in self.processing_stats:
+                        self.processing_stats[class_id].append(processing_time)
 
                     if result.get("success"):
                         next_item.status = "completed"
@@ -318,7 +365,7 @@ class ConnectionManager:
                 # Обновляем статус очереди
                 await self.send_queue_status(class_id)
 
-                # Очищаем старые завершенные элементы (опционально)
+                # Очищаем старые завершенные элементы
                 await self.cleanup_completed_items(class_id)
 
             except asyncio.CancelledError:
@@ -346,16 +393,18 @@ class ConnectionManager:
         if class_id not in self.class_queues:
             return {
                 "queue_size": 0,
+                "queued": 0,
                 "processing": 0,
                 "completed": 0,
                 "failed": 0,
-                "items": [],
                 "estimated_wait_seconds": 0,
-                "avg_processing_time": 6.0
+                "avg_processing_time": 6.0,
+                "items": []
             }
 
-        async with self.queue_locks[class_id]:
-            queue = self.class_queues[class_id]
+        lock = self.queue_locks.get(class_id, asyncio.Lock())
+        async with lock:
+            queue = self.class_queues.get(class_id, [])
             queued = [q for q in queue if q.status == "queued"]
             processing = [q for q in queue if q.status == "processing"]
             completed = [q for q in queue if q.status == "completed"]
