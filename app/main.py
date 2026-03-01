@@ -1,3 +1,4 @@
+# app/main.py
 import asyncio
 from http.client import HTTPException
 from fastapi import FastAPI
@@ -7,11 +8,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import gc
 import os
+from datetime import datetime
 
-from .routers.assessit_ws import start_heartbeat
+from .routers.assessit_ws import start_heartbeat, manager
 from .workers.queue_worker import get_queue_worker
 
-background_tasks = set()
 
 def add_exception_handlers(app):
     @app.exception_handler(AppException)
@@ -50,6 +51,7 @@ def add_exception_handlers(app):
             }
         )
 
+
 app = FastAPI(
     title="AssessIt - backend",
     description="Образовательная платформа с системой автоматической проверки работ AssessIt",
@@ -82,29 +84,71 @@ app.include_router(users.router)
 app.include_router(assessit.router)
 app.include_router(assessit_ws.router)
 
+# Хранилище для фоновых задач
+background_tasks = set()
+
 
 @app.on_event("startup")
-def on_startup():
+async def on_startup():
     """Оптимизация при запуске"""
     # Устанавливаем переменные окружения для оптимизации памяти
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
 
-    asyncio.create_task(start_heartbeat())
+    # Запускаем heartbeat для WebSocket
+    heartbeat_task = asyncio.create_task(start_heartbeat())
+    background_tasks.add(heartbeat_task)
+    heartbeat_task.add_done_callback(background_tasks.discard)
+
+    # Запускаем воркер очереди
+    worker = get_queue_worker()
+    worker_task = asyncio.create_task(worker.run_forever())
+    background_tasks.add(worker_task)
+    worker_task.add_done_callback(background_tasks.discard)
 
     print("AssessIt backend starting with memory optimization")
     print(f"Available memory optimization active")
+    print(f"Background tasks started: {len(background_tasks)}")
 
     # Принудительный сбор мусора
     gc.collect()
 
-    worker = get_queue_worker()
-    task = asyncio.create_task(worker.run_forever())
-    background_tasks.add(task)
-    task.add_done_callback(background_tasks.discard)
 
-    logger.info("Started background queue worker")
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Очистка при завершении"""
+    logger.info("Shutting down server...")
+
+    # Останавливаем воркер
+    worker = get_queue_worker()
+    worker.stop()
+
+    # Отменяем все фоновые задачи
+    if background_tasks:
+        for task in background_tasks:
+            task.cancel()
+
+        # Ждем завершения задач (но не используем await в синхронной функции)
+        # Вместо этого создаем новую асинхронную задачу для ожидания
+        asyncio.create_task(_wait_for_tasks())
+
+    # Очистка других ресурсов
+    import sys
+    if 'app.processing.ocr_engine' in sys.modules:
+        del sys.modules['app.processing.ocr_engine']
+
+    gc.collect()
+    logger.info("Shutdown complete")
+
+
+async def _wait_for_tasks():
+    """Вспомогательная функция для ожидания завершения задач"""
+    if background_tasks:
+        try:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+        except Exception as e:
+            logger.error(f"Error while waiting for tasks: {e}")
 
 
 @app.get("/")
@@ -122,30 +166,12 @@ async def root():
         }
     }
 
-@app.on_event("shutdown")
-def shutdown_event():
-    """Очистка при завершении"""
-    # Останавливаем воркер
-    worker = get_queue_worker()
-    worker.stop()
-
-    # Ждем завершения фоновых задач
-    if background_tasks:
-        await asyncio.gather(*background_tasks, return_exceptions=True)
-
-    import sys
-    if 'app.processing.ocr_engine' in sys.modules:
-        del sys.modules['app.processing.ocr_engine']
-    gc.collect()
-
 
 @app.get("/health")
 async def health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
-        "service": "lexis-backend"
+        "service": "lexis-backend",
+        "background_tasks": len(background_tasks)
     }
-
-
-from datetime import datetime  # Добавляем импорт
