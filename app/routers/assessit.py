@@ -13,7 +13,6 @@ from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Backgro
 from fastapi.responses import JSONResponse
 from sqlmodel import Session, select
 
-from .assessit_ws import manager, add_works_to_queue
 from .. import app
 from ..crud.queue import get_queue_stats, get_class_queue_items
 from ..db import get_session
