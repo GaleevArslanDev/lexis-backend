@@ -47,10 +47,6 @@ from ..schemas import (
 )
 from ..workers.queue_worker import get_queue_worker
 
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from ..main import app
-
 logger = logging.getLogger(__name__)
 
 _background_workers = set()
@@ -59,28 +55,6 @@ router = APIRouter(prefix="/assessit", tags=["assessit"])
 
 # Инициализация клиента v1
 ocr_client_v1 = get_ocr_client_v1()
-
-
-@app.on_event("startup")
-async def startup_queue_workers():
-    """Запустить фоновые воркеры при старте"""
-    worker = get_queue_worker()
-    # Запускаем воркер в фоне
-    task = asyncio.create_task(worker.run_forever())
-    _background_workers.add(task)
-    task.add_done_callback(_background_workers.discard)
-    logger.info("Started background queue worker")
-
-
-@app.on_event("shutdown")
-async def shutdown_queue_workers():
-    """Остановить воркеры при завершении"""
-    worker = get_queue_worker()
-    worker.stop()
-
-    # Ждем завершения задач
-    if _background_workers:
-        await asyncio.gather(*_background_workers, return_exceptions=True)
 
 @router.get("/dashboard/{teacher_id}", response_model=DashboardStats)
 async def get_dashboard(
