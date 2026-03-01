@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import time
@@ -13,6 +14,8 @@ from fastapi.responses import JSONResponse
 from sqlmodel import Session, select
 
 from .assessit_ws import manager, add_works_to_queue
+from .. import app
+from ..crud.queue import get_queue_stats, get_class_queue_items
 from ..db import get_session
 from ..dependencies.auth import get_current_user
 from ..dependencies_util import require_role
@@ -43,13 +46,38 @@ from ..schemas import (
     DashboardStats,
     CommonError, SystemHealthResponse
 )
+from ..workers.queue_worker import get_queue_worker
 
 logger = logging.getLogger(__name__)
+
+_background_workers = set()
 
 router = APIRouter(prefix="/assessit", tags=["assessit"])
 
 # Инициализация клиента v1
 ocr_client_v1 = get_ocr_client_v1()
+
+
+@app.on_event("startup")
+async def startup_queue_workers():
+    """Запустить фоновые воркеры при старте"""
+    worker = get_queue_worker()
+    # Запускаем воркер в фоне
+    task = asyncio.create_task(worker.run_forever())
+    _background_workers.add(task)
+    task.add_done_callback(_background_workers.discard)
+    logger.info("Started background queue worker")
+
+
+@app.on_event("shutdown")
+async def shutdown_queue_workers():
+    """Остановить воркеры при завершении"""
+    worker = get_queue_worker()
+    worker.stop()
+
+    # Ждем завершения задач
+    if _background_workers:
+        await asyncio.gather(*_background_workers, return_exceptions=True)
 
 @router.get("/dashboard/{teacher_id}", response_model=DashboardStats)
 async def get_dashboard(
@@ -240,38 +268,44 @@ async def verify_work(
     )
 
 
-@router.get("/queue/{class_id}/status")
+@router.get("/queue/status", response_model=dict)
 async def get_queue_status(
+        session: Session = Depends(get_session),
+        current_user: User = Depends(get_current_user)
+):
+    """Получить глобальный статус очереди"""
+    stats = get_queue_stats(session)
+
+    # Добавляем информацию о воркере
+    worker = get_queue_worker()
+    stats["worker"] = {
+        "id": worker.worker_id,
+        "is_running": worker.is_running
+    }
+
+    return stats
+
+
+@router.get("/queue/class/{class_id}", response_model=list)
+async def get_class_queue(
         class_id: int,
+        limit: int = 50,
         session: Session = Depends(get_session),
         current_user: User = Depends(require_role("teacher"))
 ):
-    """Получить статус очереди для класса"""
+    """Получить очередь для конкретного класса"""
 
-    # Проверяем права
+    # Проверка прав
     class_obj = session.get(Class, class_id)
     if not class_obj or class_obj.teacher_id != current_user.id:
         raise AppException(
             status_code=403,
             error_code=ErrorCode.ACCESS_DENIED,
-            message="Not your class",
-            details={"class_id": class_id}
+            message="Not your class"
         )
 
-    if class_id not in manager.class_queues:
-        return {
-            "queue_size": 0,
-            "estimated_wait_seconds": 0,
-            "status": "idle"
-        }
-
-    queue_size = manager.class_queues[class_id].qsize()
-    return {
-        "queue_size": queue_size,
-        "estimated_wait_seconds": queue_size * 6,
-        "estimated_wait_minutes": round(queue_size * 6 / 60, 1),
-        "status": "processing" if queue_size > 0 else "idle"
-    }
+    items = get_class_queue_items(session, class_id, limit)
+    return items
 
 
 @router.get("/debug/queue/{class_id}")
@@ -351,41 +385,87 @@ async def batch_upload_works(
         ...
     ]
 
-    Все работы автоматически попадают в очередь.
+    Все работы автоматически попадают в очередь на основе БД.
     Статус обработки можно отслеживать через WebSocket.
     """
+    # Для сбора созданных записей и ошибок
+    created_images = []
+    failed_files = []
+    queue_items = []
+    student_names = {}
+
     try:
         # Парсим маппинг студентов
-        student_mapping = json.loads(students_json)
-        if not isinstance(student_mapping, list):
-            raise HTTPException(status_code=400, detail="students_json must be a list")
+        try:
+            student_mapping = json.loads(students_json)
+            if not isinstance(student_mapping, list):
+                raise HTTPException(
+                    status_code=400,
+                    detail="students_json must be a list"
+                )
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid JSON in students_json. Expected format: [{'filename': 'photo1.jpg', 'student_id': 123}]"
+            )
 
         # Создаем словарь filename -> student_id
         file_to_student = {item["filename"]: item["student_id"] for item in student_mapping}
 
+        # Проверяем, что все файлы имеют маппинг
+        uploaded_filenames = [file.filename for file in files]
+        for filename in uploaded_filenames:
+            if filename not in file_to_student:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No student mapping for file: {filename}"
+                )
+
         # Проверяем, что класс принадлежит учителю
         class_obj = session.get(Class, class_id)
-        if not class_obj or class_obj.teacher_id != current_user.id:
-            raise HTTPException(status_code=403, detail="Not your class")
+        if not class_obj:
+            raise HTTPException(status_code=404, detail="Class not found")
+
+        if class_obj.teacher_id != current_user.id:
+            raise HTTPException(
+                status_code=403,
+                detail="You do not have permission to upload to this class"
+            )
 
         # Получаем задание
         assignment = session.get(Assignment, assignment_id)
         if not assignment:
             raise HTTPException(status_code=404, detail="Assignment not found")
 
+        # Проверяем, что задание принадлежит этому классу
+        if assignment.class_id != class_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Assignment does not belong to this class"
+            )
+
         # Получаем всех учеников класса для проверки
         students = session.exec(
-            select(User).join(ClassStudentLink).where(ClassStudentLink.class_id == class_id)
+            select(User)
+            .join(ClassStudentLink)
+            .where(ClassStudentLink.class_id == class_id)
+            .where(User.role == "student")
         ).all()
+
         valid_student_ids = {s.id for s in students}
 
         # Создаем словарь student_id -> имя для быстрого доступа
         student_names = {s.id: f"{s.name} {s.surname}" for s in students}
 
-        # Подготавливаем работы для очереди
-        works_for_queue = []
-        created_images = []
+        # Проверяем, что все указанные student_id действительно в классе
+        for filename, student_id in file_to_student.items():
+            if student_id not in valid_student_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Student {student_id} is not in class {class_id} (file: {filename})"
+                )
 
+        # Обрабатываем каждый файл
         for file in files:
             try:
                 # Определяем student_id для этого файла
@@ -394,13 +474,19 @@ async def batch_upload_works(
                 if not student_id:
                     raise ValueError(f"No student_id mapping for file {file.filename}")
 
-                if student_id not in valid_student_ids:
-                    raise ValueError(f"Student {student_id} not in class {class_id}")
-
                 # Читаем содержимое файла (макс 10MB)
                 file_content = await file.read()
-                if len(file_content) > 10 * 1024 * 1024:
+                if len(file_content) > 10 * 1024 * 1024:  # 10MB limit
                     raise ValueError(f"File {file.filename} exceeds 10MB limit")
+
+                # Проверяем, что файл не пустой
+                if len(file_content) == 0:
+                    raise ValueError(f"File {file.filename} is empty")
+
+                # Проверяем MIME тип
+                allowed_types = ['image/jpeg', 'image/png', 'image/jpg', 'application/pdf']
+                if file.content_type not in allowed_types:
+                    raise ValueError(f"File {file.filename} has unsupported type: {file.content_type}")
 
                 # Создаем запись в БД
                 image = create_assessment_image(
@@ -414,55 +500,181 @@ async def batch_upload_works(
                 )
                 created_images.append(image)
 
-                # Подготавливаем для очереди
-                works_for_queue.append({
-                    "work_id": image.id,
-                    "student_id": student_id,
-                    "student_name": student_names.get(student_id, "Unknown"),
-                    "assignment_id": assignment_id,
-                    "class_id": class_id,
-                    "image_bytes": file_content,
-                    "filename": file.filename,
-                    "reference_answer": assignment.reference_answer,
-                    "reference_formulas": [assignment.reference_solution] if assignment.reference_solution else None
-                })
+                # Важно: Сохраняем файл во временное хранилище
+                # Для Render можно использовать /tmp или постоянное хранилище
+                file_path = save_image_file(file_content, image.id, file.filename)
+
+                # Обновляем путь к файлу в БД
+                image.original_image_path = file_path
+                session.add(image)
+                session.commit()
+
+                # Добавляем в очередь через БД вместо Celery
+                from ..crud.queue import add_to_queue
+                queue_item = add_to_queue(
+                    session=session,
+                    image_id=image.id,
+                    priority=0,  # Обычный приоритет
+                    max_retries=3
+                )
+                queue_items.append(queue_item)
+
+                # Обновляем статус
+                update_image_status(session, image.id, "queued")
+
+                logger.info(f"Added work {image.id} to queue for student {student_id}")
 
             except Exception as e:
                 logger.error(f"Error processing {file.filename}: {str(e)}")
+                failed_files.append({
+                    "filename": file.filename,
+                    "error": str(e)
+                })
                 # Продолжаем с другими файлами
 
-        if not works_for_queue:
-            raise HTTPException(status_code=400, detail="No valid works to process")
+        # Финальный коммит всех изменений
+        session.commit()
 
-        # Добавляем все в очередь
-        position = await add_works_to_queue(
-            class_id=class_id,
-            works=works_for_queue,
-            session=session
-        )
+        # Проверяем, есть ли успешные загрузки
+        if not created_images:
+            error_detail = "No valid works to process"
+            if failed_files:
+                error_detail += f". Failed files: {failed_files}"
+            raise HTTPException(
+                status_code=400,
+                detail=error_detail
+            )
+
+        # Получаем статистику очереди для оценки времени ожидания
+        from ..crud.queue import get_queue_stats
+        queue_stats = get_queue_stats(session)
+
+        # Оцениваем позицию в очереди (сколько задач перед нашими)
+        pending_count = queue_stats.get("pending", 0)
+
+        # Среднее время обработки (из статистики или по умолчанию 6 секунд)
+        avg_processing_time = queue_stats.get("avg_processing_seconds", 6.0)
 
         # Оцениваем время ожидания
-        avg_time = manager.get_avg_processing_time(class_id)
-        estimated_wait = len(works_for_queue) * avg_time
+        # Если наши задачи в начале очереди, то ждать меньше
+        # Берем минимум между всеми pending и нашими задачами
+        estimated_wait = min(pending_count, len(created_images)) * avg_processing_time
 
-        return BatchUploadResponse(
+        # Формируем ответ
+        response = BatchUploadResponse(
             batch_id=str(uuid.uuid4()),
-            total_submitted=len(works_for_queue),
-            queue_position=position,
+            total_submitted=len(created_images),
+            queue_position=pending_count - len(created_images) + 1,  # Примерная позиция
             estimated_wait_seconds=int(estimated_wait),
-            status="queued"
+            status="queued",
+            task_ids=[str(item.id) for item in queue_items]  # Используем ID из очереди
         )
 
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON in students_json")
+        # Отправляем уведомление через WebSocket (без Redis)
+        try:
+            from .assessit_ws import manager
+
+            # Формируем список успешно добавленных работ
+            successful_works = []
+            for i, image in enumerate(created_images):
+                successful_works.append({
+                    "work_id": image.id,
+                    "student_id": image.student_id,
+                    "student_name": student_names.get(image.student_id, "Unknown"),
+                    "queue_id": queue_items[i].id if i < len(queue_items) else None
+                })
+
+            notification = {
+                "type": "new_works_added",
+                "data": {
+                    "count": len(successful_works),
+                    "works": successful_works,
+                    "queue_stats": {
+                        "pending": queue_stats.get("pending", 0),
+                        "processing": queue_stats.get("processing", 0),
+                        "estimated_wait_seconds": estimated_wait
+                    },
+                    "batch_id": response.batch_id,
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+            }
+
+            # Отправляем через WebSocket менеджер (прямая рассылка)
+            await manager.broadcast_to_class(class_id, notification)
+
+        except Exception as e:
+            logger.error(f"Failed to send WebSocket notification: {e}")
+
+        # Если были ошибки, добавляем их в ответ
+        if failed_files:
+            # Создаем словарь с ответом и добавляем failed_files
+            response_dict = response.dict()
+            response_dict["failed_files"] = failed_files
+            response_dict["partial_success"] = True
+            response_dict["message"] = f"Successfully uploaded {len(created_images)} files, {len(failed_files)} failed"
+            return response_dict
+
+        return response
+
+    except HTTPException:
+        # Пробрасываем HTTP исключения
+        session.rollback()
+        raise
     except Exception as e:
+        # Логируем и откатываем транзакцию
         logger.error(f"Batch upload error: {str(e)}", exc_info=True)
+        session.rollback()
+
+        # Если были созданы записи в БД, помечаем их как ошибки
+        if created_images:
+            for image in created_images:
+                try:
+                    update_image_status(session, image.id, "error", str(e))
+                except:
+                    pass
+            session.commit()
+
         raise AppException(
             status_code=500,
             error_code=ErrorCode.INTERNAL_ERROR,
             message="Batch upload failed",
-            details={"error": str(e)}
+            details={
+                "error": str(e),
+                "failed_files": failed_files if failed_files else [],
+                "successful_count": len(created_images) if created_images else 0
+            }
         )
+
+
+# Вспомогательная функция для сохранения файла
+def save_image_file(file_content: bytes, image_id: int, filename: str) -> str:
+    """
+    Сохранить файл изображения на диск
+    Для Render используем /tmp или постоянное хранилище
+    """
+    import os
+    from datetime import datetime
+
+    # Создаем директорию для загрузок, если её нет
+    upload_dir = os.getenv("UPLOAD_DIR", "/tmp/uploads")
+    os.makedirs(upload_dir, exist_ok=True)
+
+    # Создаем поддиректорию по дате
+    date_str = datetime.utcnow().strftime("%Y%m%d")
+    date_dir = os.path.join(upload_dir, date_str)
+    os.makedirs(date_dir, exist_ok=True)
+
+    # Генерируем имя файла: {image_id}_{timestamp}_{original_filename}
+    timestamp = datetime.utcnow().strftime("%H%M%S")
+    safe_filename = "".join(c for c in filename if c.isalnum() or c in '._-')[:50]
+    file_path = os.path.join(date_dir, f"{image_id}_{timestamp}_{safe_filename}")
+
+    # Сохраняем файл
+    with open(file_path, "wb") as f:
+        f.write(file_content)
+
+    logger.info(f"Saved file to {file_path}")
+    return file_path
 
 
 @router.get("/work-details/{work_id}", response_model=DetailedAnalysisResponse)

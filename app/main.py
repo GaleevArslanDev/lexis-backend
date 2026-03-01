@@ -9,7 +9,9 @@ import gc
 import os
 
 from .routers.assessit_ws import start_heartbeat
+from .workers.queue_worker import get_queue_worker
 
+background_tasks = set()
 
 def add_exception_handlers(app):
     @app.exception_handler(AppException)
@@ -97,6 +99,13 @@ def on_startup():
     # Принудительный сбор мусора
     gc.collect()
 
+    worker = get_queue_worker()
+    task = asyncio.create_task(worker.run_forever())
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
+    logger.info("Started background queue worker")
+
 
 @app.get("/")
 async def root():
@@ -116,6 +125,14 @@ async def root():
 @app.on_event("shutdown")
 def shutdown_event():
     """Очистка при завершении"""
+    # Останавливаем воркер
+    worker = get_queue_worker()
+    worker.stop()
+
+    # Ждем завершения фоновых задач
+    if background_tasks:
+        await asyncio.gather(*background_tasks, return_exceptions=True)
+
     import sys
     if 'app.processing.ocr_engine' in sys.modules:
         del sys.modules['app.processing.ocr_engine']

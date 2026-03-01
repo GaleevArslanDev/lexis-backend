@@ -335,3 +335,34 @@ class SystemMetrics(SQLModel, table=True):
 
     class Config:
         from_attributes = True
+
+
+class ProcessingQueue(SQLModel, table=True):
+    """Очередь обработки изображений на основе БД"""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    image_id: int = Field(foreign_key="assessmentimage.id", index=True)
+
+    # Статус: pending, processing, completed, failed
+    status: str = Field(default="pending", index=True)
+
+    # Приоритет (меньше = выше приоритет)
+    priority: int = Field(default=0, index=True)
+
+    # Попытки обработки
+    retry_count: int = Field(default=0)
+    max_retries: int = Field(default=3)
+
+    # Временные метки
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+    # Результат/ошибка
+    result_data: Optional[str] = None  # JSON с результатом
+    error_message: Optional[str] = None
+
+    # ID воркера (для распределенной обработки)
+    worker_id: Optional[str] = None
+
+    class Config:
+        from_attributes = True

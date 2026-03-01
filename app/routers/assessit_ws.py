@@ -1,106 +1,46 @@
+# app/routers/assessit_ws.py
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, Query, status
-from typing import Dict, Set, Optional, List
+from typing import Dict, Set, Optional, List, Any
 import asyncio
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from sqlmodel import Session, select
 from jose import jwt
 import uuid
-import time
 
-from ..db import get_session, engine
-from ..models import User, Class, AssessmentImage, RecognizedSolution, Assignment
+from ..db import get_session
+from ..dependencies_util import require_role
+from ..models import User, Class, AssessmentImage
 from ..utils.security import SECRET_KEY, ALGORITHM
-from ..exceptions import AppException, ErrorCode
-from ..ocr_client import get_ocr_client_v1
-from ..crud.assessment import (
-    update_image_status,
-    create_recognized_solution_v1,
-    get_recognized_solution
-)
-
-def get_db_session():
-    """Создать временную сессию БД"""
-    from sqlmodel import Session
-    from ..db import engine
-    return Session(engine)
+from ..crud.queue import get_class_queue_items
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["websocket"])
 
 
-class QueueItem:
-    """Элемент очереди с полным статусом"""
-
-    def __init__(self, work_id: int, student_id: int, student_name: str,
-                 image_bytes: bytes, filename: str,
-                 assignment_id: int, class_id: int,
-                 reference_answer: Optional[str] = None,
-                 reference_formulas: Optional[list] = None):
-        self.id = str(uuid.uuid4())
-        self.work_id = work_id
-        self.student_id = student_id
-        self.student_name = student_name
-        self.image_bytes = image_bytes
-        self.filename = filename
-        self.assignment_id = assignment_id
-        self.class_id = class_id
-        self.reference_answer = reference_answer
-        self.reference_formulas = reference_formulas
-        self.status = "queued"  # queued, processing, completed, failed
-        self.position = 0
-        self.queued_at = datetime.utcnow()
-        self.started_at = None
-        self.completed_at = None
-        self.error = None
-        self.result = None
-        self.retry_count = 0
-
-
 class ConnectionManager:
+    """
+    Менеджер WebSocket соединений без Redis
+    Хранит все соединения в памяти
+    """
+
     def __init__(self):
         # Класс -> множество подключений учителей
         self.class_connections: Dict[int, Set[WebSocket]] = {}
-        # Очереди по классам (используем asyncio.Queue для правильной работы)
-        self.class_queues: Dict[int, asyncio.Queue] = {}
-        # Словарь для хранения элементов очереди с их статусами
-        self.queue_items: Dict[int, List[QueueItem]] = {}  # class_id -> list of items
-        # Задачи обработки очередей
-        self.processing_tasks: Dict[int, asyncio.Task] = {}
-        # Блокировки для каждой очереди
-        self.queue_locks: Dict[int, asyncio.Lock] = {}
-        # Статистика обработки
-        self.processing_stats: Dict[int, List[float]] = {}
-        # Активные соединения
+        # User ID -> множество подключений (для личных уведомлений)
+        self.user_connections: Dict[int, Set[WebSocket]] = {}
+        # Активные соединения (для мониторинга)
         self.active_connections: Set[WebSocket] = set()
-        # Запущен ли heartbeat
-        self.heartbeat_task = None
 
-    async def start_heartbeat(self):
-        """Запускаем фоновую задачу для heartbeat"""
-        while True:
-            try:
-                await asyncio.sleep(30)
-                disconnected = set()
-                for conn in self.active_connections:
-                    try:
-                        await conn.send_json({
-                            "type": "heartbeat",
-                            "timestamp": datetime.utcnow().isoformat()
-                        })
-                    except:
-                        disconnected.add(conn)
+        # Очередь сообщений для каждого класса (для отказоустойчивости)
+        self.class_message_queues: Dict[int, asyncio.Queue] = {}
 
-                # Удаляем отключившиеся соединения
-                for conn in disconnected:
-                    self.active_connections.discard(conn)
-                    for class_id, connections in self.class_connections.items():
-                        connections.discard(conn)
+        # Задачи для обработки очередей
+        self.queue_tasks: Dict[int, asyncio.Task] = {}
 
-            except Exception as e:
-                logger.error(f"Heartbeat error: {e}")
+        logger.info("ConnectionManager initialized (in-memory mode)")
 
     async def connect(self, websocket: WebSocket, class_id: int, user_id: int):
         """Подключение клиента"""
@@ -108,404 +48,224 @@ class ConnectionManager:
 
         self.active_connections.add(websocket)
 
-        # Инициализируем структуры для класса если нужно
+        # Добавляем в класс
         if class_id not in self.class_connections:
             self.class_connections[class_id] = set()
-            self.class_queues[class_id] = asyncio.Queue()
-            self.queue_items[class_id] = []
-            self.queue_locks[class_id] = asyncio.Lock()
-            self.processing_stats[class_id] = []
-
+            # Создаем очередь сообщений для класса
+            self.class_message_queues[class_id] = asyncio.Queue()
             # Запускаем обработчик очереди
-            self.processing_tasks[class_id] = asyncio.create_task(
-                self.process_queue(class_id)
+            self.queue_tasks[class_id] = asyncio.create_task(
+                self._process_class_queue(class_id)
             )
-            logger.info(f"Started queue processor for class {class_id}")
 
         self.class_connections[class_id].add(websocket)
 
-        # Отправляем текущее состояние очереди
-        await self.send_queue_status(class_id)
+        # Добавляем в пользовательские соединения
+        if user_id not in self.user_connections:
+            self.user_connections[user_id] = set()
+        self.user_connections[user_id].add(websocket)
 
-        logger.info(f"User {user_id} connected to class {class_id}")
+        # Отправляем подтверждение подключения
+        await websocket.send_json({
+            "type": "connected",
+            "data": {
+                "class_id": class_id,
+                "user_id": user_id,
+                "message": "Connected to class updates",
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        })
 
-    def disconnect(self, websocket: WebSocket, class_id: int):
+        # Отправляем текущий статус очереди
+        await self._send_queue_status(class_id, websocket)
+
+        logger.info(f"User {user_id} connected to class {class_id}. Total connections: {len(self.active_connections)}")
+
+    def disconnect(self, websocket: WebSocket, class_id: int, user_id: int):
         """Отключение клиента"""
         self.active_connections.discard(websocket)
 
+        # Удаляем из класса
         if class_id in self.class_connections:
             self.class_connections[class_id].discard(websocket)
 
-            # Если никого не осталось, останавливаем обработку
-            if not self.class_connections[class_id] and class_id in self.processing_tasks:
-                self.processing_tasks[class_id].cancel()
-                del self.processing_tasks[class_id]
-                logger.info(f"Stopped queue processor for class {class_id} (no connections)")
+            # Если никого не осталось в классе, останавливаем обработчик очереди
+            if not self.class_connections[class_id] and class_id in self.queue_tasks:
+                self.queue_tasks[class_id].cancel()
+                del self.queue_tasks[class_id]
+                logger.info(f"Stopped queue processor for class {class_id} (no listeners)")
+
+        # Удаляем из пользовательских соединений
+        if user_id in self.user_connections:
+            self.user_connections[user_id].discard(websocket)
+            if not self.user_connections[user_id]:
+                del self.user_connections[user_id]
+
+        logger.info(f"User {user_id} disconnected from class {class_id}")
 
     async def broadcast_to_class(self, class_id: int, message: dict):
-        """Отправить сообщение всем подключенным к классу"""
-        if class_id not in self.class_connections:
+        """
+        Отправить сообщение всем подключенным к классу
+        Если нет активных соединений, сообщение кладется в очередь
+        """
+        # Добавляем timestamp если нет
+        if "timestamp" not in message:
+            message["timestamp"] = datetime.utcnow().isoformat()
+
+        # Если есть активные соединения, отправляем сразу
+        if class_id in self.class_connections and self.class_connections[class_id]:
+            disconnected = set()
+            for connection in self.class_connections[class_id]:
+                try:
+                    await connection.send_json(message)
+                except Exception as e:
+                    logger.error(f"Failed to send to client: {e}")
+                    disconnected.add(connection)
+
+            # Удаляем отключившихся
+            for conn in disconnected:
+                self.class_connections[class_id].discard(conn)
+                self.active_connections.discard(conn)
+
+        # Если нет соединений, но есть очередь - сохраняем для последующей отправки
+        elif class_id in self.class_message_queues:
+            try:
+                # Ограничиваем размер очереди (макс 100 сообщений)
+                if self.class_message_queues[class_id].qsize() < 100:
+                    await self.class_message_queues[class_id].put(message)
+                    logger.debug(
+                        f"Queued message for class {class_id} (queue size: {self.class_message_queues[class_id].qsize()})")
+            except Exception as e:
+                logger.error(f"Failed to queue message for class {class_id}: {e}")
+
+    async def send_to_user(self, user_id: int, message: dict):
+        """Отправить сообщение конкретному пользователю"""
+        if user_id not in self.user_connections:
             return
 
+        if "timestamp" not in message:
+            message["timestamp"] = datetime.utcnow().isoformat()
+
         disconnected = set()
-        for connection in self.class_connections[class_id]:
+        for connection in self.user_connections[user_id]:
             try:
                 await connection.send_json(message)
-            except:
+            except Exception as e:
+                logger.error(f"Failed to send to user {user_id}: {e}")
                 disconnected.add(connection)
 
         # Удаляем отключившихся
         for conn in disconnected:
-            self.class_connections[class_id].discard(conn)
             self.active_connections.discard(conn)
+            self.user_connections[user_id].discard(conn)
 
-    async def add_to_queue(self, class_id: int, items: List[QueueItem]) -> int:
+    async def _process_class_queue(self, class_id: int):
         """
-        Добавить несколько работ в очередь
-        Возвращает позицию первого элемента
+        Фоновая задача для обработки очереди сообщений класса
+        Отправляет накопленные сообщения при появлении соединений
         """
-        # Гарантируем, что все структуры данных существуют
-        if class_id not in self.queue_locks:
-            self.queue_locks[class_id] = asyncio.Lock()
-        if class_id not in self.queue_items:
-            self.queue_items[class_id] = []
-        if class_id not in self.class_queues:
-            self.class_queues[class_id] = asyncio.Queue()
-        if class_id not in self.processing_stats:
-            self.processing_stats[class_id] = []
-
-        # Запускаем обработчик очереди если его нет
-        if class_id not in self.processing_tasks or self.processing_tasks[class_id].done():
-            if class_id in self.processing_tasks and self.processing_tasks[class_id].done():
-                # Если задача завершилась, удаляем её
-                try:
-                    self.processing_tasks[class_id].result()  # Может выбросить исключение
-                except Exception as e:
-                    logger.error(f"Processor for class {class_id} failed: {e}")
-                del self.processing_tasks[class_id]
-
-            # Запускаем новую
-            self.processing_tasks[class_id] = asyncio.create_task(
-                self.process_queue(class_id)
-            )
-            logger.info(f"Started queue processor for class {class_id} from add_to_queue")
-
-        async with self.queue_locks[class_id]:
-            current_size = len(self.queue_items[class_id])
-
-            for i, item in enumerate(items):
-                item.position = current_size + i + 1
-                self.queue_items[class_id].append(item)
-                await self.class_queues[class_id].put(item)  # Добавляем в asyncio.Queue
-
-                # Обновляем статус в БД - создаем временную сессию
-                try:
-                    from ..crud.assessment import update_image_status
-                    from ..db import get_session
-
-                    # Создаем временную сессию
-                    with Session(engine) as db_session:
-                        update_image_status(db_session, item.work_id, "queued")
-                        db_session.commit()
-
-                    logger.info(f"Updated DB: work {item.work_id} status = queued")
-                except Exception as e:
-                    logger.error(f"Failed to update DB for work {item.work_id}: {e}")
-
-                logger.info(f"Added work {item.work_id} to queue for class {class_id} at position {item.position}")
-
-            # Обновляем статус очереди
-            await self.send_queue_status(class_id)
-
-            return current_size + 1
-
-    async def send_queue_status(self, class_id: int):
-        """Отправить детальный статус очереди"""
-        if class_id not in self.queue_items:
-            return
-
-        async with self.queue_locks[class_id]:
-            items = self.queue_items[class_id]
-
-            # Считаем статистику
-            queued = [i for i in items if i.status == "queued"]
-            processing = [i for i in items if i.status == "processing"]
-            completed = [i for i in items if i.status == "completed"]
-            failed = [i for i in items if i.status == "failed"]
-
-            avg_time = self.get_avg_processing_time(class_id)
-            estimated_wait = len(queued) * avg_time
-
-            status_message = {
-                "type": "queue_status",
-                "data": {
-                    "queue_size": len(items),
-                    "queued": len(queued),
-                    "processing": len(processing),
-                    "completed": len(completed),
-                    "failed": len(failed),
-                    "estimated_wait_seconds": int(estimated_wait),
-                    "estimated_wait_minutes": round(estimated_wait / 60, 1),
-                    "avg_processing_time": round(avg_time, 1),
-                    "items": [
-                        {
-                            "work_id": item.work_id,
-                            "student_id": item.student_id,
-                            "student_name": item.student_name,
-                            "position": item.position,
-                            "status": item.status,
-                            "queued_at": item.queued_at.isoformat(),
-                            "started_at": item.started_at.isoformat() if item.started_at else None,
-                            "completed_at": item.completed_at.isoformat() if item.completed_at else None,
-                            "error": item.error
-                        }
-                        for item in items[-20:]  # Последние 20
-                    ]
-                },
-                "timestamp": datetime.utcnow().isoformat()
-            }
-
-            await self.broadcast_to_class(class_id, status_message)
-
-    def get_avg_processing_time(self, class_id: int) -> float:
-        """Среднее время обработки (секунды)"""
-        if class_id not in self.processing_stats or not self.processing_stats[class_id]:
-            return 6.0  # По умолчанию
-
-        stats = self.processing_stats[class_id][-50:]
-        return sum(stats) / len(stats) if stats else 6.0
-
-    async def process_queue(self, class_id: int):
-        """Фоновая задача для обработки очереди"""
-        logger.info(f"Queue processor started for class {class_id}")
-
-        # Гарантируем, что структуры данных существуют
-        if class_id not in self.queue_locks:
-            self.queue_locks[class_id] = asyncio.Lock()
-        if class_id not in self.queue_items:
-            self.queue_items[class_id] = []
-        if class_id not in self.processing_stats:
-            self.processing_stats[class_id] = []
-
-        client = get_ocr_client_v1()
+        logger.info(f"Started queue processor for class {class_id}")
 
         while True:
             try:
-                # Проверяем, существует ли еще очередь
-                if class_id not in self.class_queues:
-                    logger.info(f"Queue for class {class_id} no longer exists, stopping processor")
-                    break
-
-                # Ждем элемент из очереди
-                item = await self.class_queues[class_id].get()
-                # Обновляем статус
-                async with self.queue_locks[class_id]:
-                    item.status = "processing"
-                    item.started_at = datetime.utcnow()
-
-                # Обновляем в БД
-                with next(get_session()) as session:
-                    update_image_status(session, item.work_id, "processing")
-
-                # Уведомляем о начале
-                await self.broadcast_to_class(class_id, {
-                    "type": "work_started",
-                    "data": {
-                        "work_id": item.work_id,
-                        "student_id": item.student_id,
-                        "student_name": item.student_name,
-                        "position": item.position
-                    },
-                    "timestamp": datetime.utcnow().isoformat()
-                })
-
-                # Обрабатываем
-                start_time = time.time()
+                # Ждем сообщение из очереди (с таймаутом для проверки соединений)
                 try:
-                    logger.info(f"Sending to OCR API: work {item.work_id}")
-
-                    result = client.assess_solution(
-                        image_bytes=item.image_bytes,
-                        filename=item.filename,
-                        reference_answer=item.reference_answer,
-                        reference_formulas=item.reference_formulas
+                    message = await asyncio.wait_for(
+                        self.class_message_queues[class_id].get(),
+                        timeout=5.0
                     )
-
-                    processing_time = time.time() - start_time
-
-                    # Сохраняем статистику
-                    self.processing_stats[class_id].append(processing_time)
-
-                    if result.get("success") and result.get("assessment"):
-                        assessment = result["assessment"]
-
-                        # Сохраняем результат в БД
-                        with next(get_session()) as session:
-                            # Создаем запись распознанного решения
-                            solution = create_recognized_solution_v1(
-                                session=session,
-                                image_id=item.work_id,
-                                assessment_data=assessment
-                            )
-
-                            # Обновляем статус изображения
-                            update_image_status(session, item.work_id, "processed")
-
-                            logger.info(f"Saved solution {solution.id} for work {item.work_id}")
-
-                        # Обновляем статус в очереди
-                        async with self.queue_locks[class_id]:
-                            item.status = "completed"
-                            item.result = assessment
-                            item.completed_at = datetime.utcnow()
-
-                        # Отправляем результат
-                        await self.broadcast_to_class(class_id, {
-                            "type": "work_completed",
-                            "data": {
-                                "work_id": item.work_id,
-                                "student_id": item.student_id,
-                                "student_name": item.student_name,
-                                "confidence_score": assessment.get("confidence_score"),
-                                "check_level": f"level_{assessment.get('confidence_level', 3)}",
-                                "mark_score": assessment.get("mark_score"),
-                                "teacher_comment": assessment.get("teacher_comment")
-                            },
-                            "timestamp": datetime.utcnow().isoformat()
-                        })
-
+                except asyncio.TimeoutError:
+                    # Проверяем, есть ли еще слушатели
+                    if class_id not in self.class_connections or not self.class_connections[class_id]:
+                        # Если слушателей нет, продолжаем ждать
+                        continue
                     else:
-                        error_msg = result.get("error", "Unknown OCR error")
+                        # Есть слушатели, но очередь пуста
+                        continue
 
-                        # Обновляем статус в БД
-                        with next(get_session()) as session:
-                            update_image_status(session, item.work_id, "error", error_msg)
-
-                        async with self.queue_locks[class_id]:
-                            item.status = "failed"
-                            item.error = error_msg
-                            item.completed_at = datetime.utcnow()
-
-                        await self.broadcast_to_class(class_id, {
-                            "type": "work_failed",
-                            "data": {
-                                "work_id": item.work_id,
-                                "student_id": item.student_id,
-                                "student_name": item.student_name,
-                                "error": error_msg
-                            },
-                            "timestamp": datetime.utcnow().isoformat()
-                        })
-
-                except Exception as e:
-                    logger.error(f"Error processing work {item.work_id}: {e}", exc_info=True)
-
-                    # Обновляем статус в БД
-                    with next(get_session()) as session:
-                        update_image_status(session, item.work_id, "error", str(e))
-
-                    async with self.queue_locks[class_id]:
-                        item.status = "failed"
-                        item.error = str(e)
-                        item.completed_at = datetime.utcnow()
-
-                    await self.broadcast_to_class(class_id, {
-                        "type": "work_failed",
-                        "data": {
-                            "work_id": item.work_id,
-                            "student_id": item.student_id,
-                            "student_name": item.student_name,
-                            "error": str(e)
-                        },
-                        "timestamp": datetime.utcnow().isoformat()
-                    })
-
-                # Отправляем обновленный статус очереди
-                await self.send_queue_status(class_id)
-
-                # Помечаем задачу как выполненную
-                self.class_queues[class_id].task_done()
-
-                # Очищаем старые элементы
-                await self.cleanup_completed_items(class_id)
+                # Если есть слушатели, отправляем
+                if class_id in self.class_connections and self.class_connections[class_id]:
+                    await self.broadcast_to_class(class_id, message)
+                else:
+                    # Если слушателей нет, возвращаем в очередь
+                    await self.class_message_queues[class_id].put(message)
+                    await asyncio.sleep(1)
 
             except asyncio.CancelledError:
-                logger.info(f"Queue processing for class {class_id} cancelled")
+                logger.info(f"Queue processor for class {class_id} cancelled")
                 break
             except Exception as e:
-                logger.error(f"Error in queue processing: {e}", exc_info=True)
+                logger.error(f"Error in queue processor for class {class_id}: {e}")
                 await asyncio.sleep(5)
 
-    async def cleanup_completed_items(self, class_id: int):
-        """Очистка старых завершенных элементов"""
-        if class_id not in self.queue_items:
-            return
+    async def _send_queue_status(self, class_id: int, websocket: WebSocket):
+        """Отправить текущий статус очереди для класса"""
+        try:
+            from ..db import engine
+            from sqlmodel import Session
 
-        async with self.queue_locks[class_id]:
-            cutoff = datetime.utcnow() - timedelta(minutes=5)
-            self.queue_items[class_id] = [
-                item for item in self.queue_items[class_id]
-                if item.status in ["queued", "processing"] or
-                   (item.completed_at and item.completed_at > cutoff)
-            ]
+            with Session(engine) as session:
+                queue_items = get_class_queue_items(session, class_id, limit=20)
 
-    async def get_queue_status(self, class_id: int) -> dict:
-        """Получить полный статус очереди"""
-        if class_id not in self.queue_items:
-            return {
-                "queue_size": 0,
-                "queued": 0,
-                "processing": 0,
-                "completed": 0,
-                "failed": 0,
-                "estimated_wait_seconds": 0,
-                "avg_processing_time": 6.0,
-                "items": []
-            }
+                # Получаем статистику
+                pending = sum(1 for item in queue_items if item["status"] == "pending")
+                processing = sum(1 for item in queue_items if item["status"] == "processing")
 
-        async with self.queue_locks[class_id]:
-            items = self.queue_items[class_id]
-            queued = [i for i in items if i.status == "queued"]
-            processing = [i for i in items if i.status == "processing"]
-            completed = [i for i in items if i.status == "completed"]
-            failed = [i for i in items if i.status == "failed"]
-
-            avg_time = self.get_avg_processing_time(class_id)
-            estimated_wait = len(queued) * avg_time
-
-            return {
-                "queue_size": len(items),
-                "queued": len(queued),
-                "processing": len(processing),
-                "completed": len(completed),
-                "failed": len(failed),
-                "estimated_wait_seconds": int(estimated_wait),
-                "avg_processing_time": round(avg_time, 1),
-                "items": [
-                    {
-                        "work_id": item.work_id,
-                        "student_id": item.student_id,
-                        "student_name": item.student_name,
-                        "position": item.position,
-                        "status": item.status,
-                        "queued_at": item.queued_at.isoformat(),
-                        "started_at": item.started_at.isoformat() if item.started_at else None,
-                        "completed_at": item.completed_at.isoformat() if item.completed_at else None,
-                        "error": item.error
+                await websocket.send_json({
+                    "type": "queue_status",
+                    "data": {
+                        "class_id": class_id,
+                        "pending": pending,
+                        "processing": processing,
+                        "recent_items": queue_items[:10],
+                        "timestamp": datetime.utcnow().isoformat()
                     }
-                    for item in items
-                ]
+                })
+        except Exception as e:
+            logger.error(f"Failed to send queue status: {e}")
+
+    async def notify_work_update(self, work_id: int, class_id: int, status: str, data: dict = None):
+        """Уведомить об обновлении статуса работы"""
+        message = {
+            "type": "work_status_update",
+            "data": {
+                "work_id": work_id,
+                "status": status,
+                "timestamp": datetime.utcnow().isoformat()
             }
+        }
+
+        if data:
+            message["data"].update(data)
+
+        await self.broadcast_to_class(class_id, message)
+
+    async def notify_batch_upload(self, class_id: int, batch_data: dict):
+        """Уведомить о пакетной загрузке"""
+        message = {
+            "type": "batch_upload",
+            "data": {
+                **batch_data,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        }
+        await self.broadcast_to_class(class_id, message)
+
+    def get_stats(self) -> dict:
+        """Получить статистику соединений"""
+        return {
+            "total_connections": len(self.active_connections),
+            "active_classes": len(self.class_connections),
+            "active_users": len(self.user_connections),
+            "class_queues": {
+                str(cid): q.qsize()
+                for cid, q in self.class_message_queues.items()
+            }
+        }
 
 
 # Создаем глобальный менеджер
 manager = ConnectionManager()
-
-
-@router.on_event("startup")
-async def start_heartbeat():
-    """Запускаем heartbeat при старте"""
-    asyncio.create_task(manager.start_heartbeat())
 
 
 async def get_current_user_ws(token: str, session: Session) -> Optional[User]:
@@ -526,11 +286,14 @@ async def websocket_class(
         token: str = Query(...),
         session: Session = Depends(get_session)
 ):
-    """WebSocket для real-time обновлений по классу"""
-
+    """
+    WebSocket для real-time обновлений по классу
+    Без Redis, использует in-memory соединения
+    """
     # Аутентификация
     user = await get_current_user_ws(token, session)
     if not user:
+        logger.warning(f"WebSocket authentication failed for class {class_id}")
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
@@ -542,105 +305,99 @@ async def websocket_class(
         return
 
     try:
+        # Подключаем
         await manager.connect(websocket, class_id, user.id)
 
+        # Основной цикл обработки сообщений
         while True:
-            # Ждем сообщения от клиента
-            data = await websocket.receive_text()
-            message = json.loads(data)
+            try:
+                # Ждем сообщения от клиента с таймаутом
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+                message = json.loads(data)
 
-            if message.get("type") == "get_queue_status":
-                status = await manager.get_queue_status(class_id)
-                await websocket.send_json({
-                    "type": "queue_status",
-                    "data": status,
-                    "timestamp": datetime.utcnow().isoformat()
-                })
+                # Обрабатываем разные типы сообщений
+                msg_type = message.get("type")
 
-            elif message.get("type") == "get_work_result":
-                work_id = message.get("work_id")
-                # Ищем результат в очереди
-                for item in manager.queue_items.get(class_id, []):
-                    if item.work_id == work_id and item.status == "completed":
+                if msg_type == "ping":
+                    # Ответ на ping
+                    await websocket.send_json({
+                        "type": "pong",
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+
+                elif msg_type == "request_queue_status":
+                    # Клиент запросил статус очереди
+                    with Session(get_session) as db_session:
+                        queue_items = get_class_queue_items(db_session, class_id, limit=20)
                         await websocket.send_json({
-                            "type": "work_result",
+                            "type": "queue_status",
                             "data": {
-                                "work_id": work_id,
-                                "result": item.result
+                                "class_id": class_id,
+                                "items": queue_items,
+                                "timestamp": datetime.utcnow().isoformat()
                             }
                         })
-                        break
 
-            elif message.get("type") == "ping":
-                await websocket.send_json({"type": "pong"})
+                elif msg_type == "subscribe_work":
+                    # Подписка на обновления конкретной работы
+                    work_id = message.get("work_id")
+                    # Можно сохранять подписки, но пока просто подтверждаем
+                    await websocket.send_json({
+                        "type": "subscribed",
+                        "data": {
+                            "work_id": work_id,
+                            "timestamp": datetime.utcnow().isoformat()
+                        }
+                    })
+
+                else:
+                    logger.debug(f"Unknown message type: {msg_type} from user {user.id}")
+
+            except asyncio.TimeoutError:
+                # Таймаут - отправляем ping для проверки соединения
+                try:
+                    await websocket.send_json({
+                        "type": "ping",
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                except:
+                    # Если не можем отправить, вероятно соединение разорвано
+                    break
 
     except WebSocketDisconnect:
-        manager.disconnect(websocket, class_id)
-        logger.info(f"User {user.id} disconnected from class {class_id}")
+        logger.info(f"WebSocket disconnected for user {user.id} from class {class_id}")
     except Exception as e:
         logger.error(f"WebSocket error for class {class_id}: {e}")
-        manager.disconnect(websocket, class_id)
+    finally:
+        # Всегда отключаем при выходе
+        manager.disconnect(websocket, class_id, user.id)
 
 
-# API функция для добавления работ в очередь
-async def add_works_to_queue(
-        class_id: int,
-        works: List[dict],
-        session: Session
-) -> int:
-    """
-    Добавить несколько работ в очередь на обработку
+@router.get("/ws/stats")
+async def websocket_stats(current_user: User = Depends(require_role("teacher"))):
+    """Получить статистику WebSocket соединений (только для админов/учителей)"""
+    return manager.get_stats()
 
-    Args:
-        class_id: ID класса
-        works: список словарей с полями:
-            - work_id: int
-            - student_id: int
-            - student_name: str
-            - assignment_id: int
-            - class_id: int
-            - image_bytes: bytes
-            - filename: str
-            - reference_answer: Optional[str]
-            - reference_formulas: Optional[list]
-        session: сессия БД (не используется здесь, но оставляем для совместимости)
 
-    Returns:
-        int: позиция первого элемента в очереди
-    """
-    logger.info(f"Adding {len(works)} works to queue for class {class_id}")
+# Функция для запуска heartbeat (опционально)
+async def start_heartbeat():
+    """Запускает периодическую отправку heartbeat для поддержания соединений"""
+    while True:
+        try:
+            await asyncio.sleep(30)  # Каждые 30 секунд
 
-    # Получаем задание для reference данных
-    if works and works[0].get("assignment_id"):
-        assignment = session.get(Assignment, works[0]["assignment_id"])
-    else:
-        assignment = None
+            # Отправляем heartbeat всем активным соединениям
+            for class_id, connections in manager.class_connections.items():
+                for conn in connections:
+                    try:
+                        await conn.send_json({
+                            "type": "heartbeat",
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                    except:
+                        pass
 
-    items = []
-    for work in works:
-        # Если reference данные не переданы, берем из задания
-        ref_answer = work.get("reference_answer")
-        ref_formulas = work.get("reference_formulas")
-
-        if not ref_answer and assignment:
-            ref_answer = assignment.reference_answer
-        if not ref_formulas and assignment and assignment.reference_solution:
-            ref_formulas = [assignment.reference_solution]
-
-        item = QueueItem(
-            work_id=work["work_id"],
-            student_id=work["student_id"],
-            student_name=work["student_name"],
-            image_bytes=work["image_bytes"],
-            filename=work["filename"],
-            assignment_id=work.get("assignment_id", 0),
-            class_id=class_id,
-            reference_answer=ref_answer,
-            reference_formulas=ref_formulas
-        )
-        items.append(item)
-
-    position = await manager.add_to_queue(class_id, items)
-    logger.info(f"Added {len(works)} works to queue for class {class_id}, first position: {position}")
-
-    return position
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Heartbeat error: {e}")

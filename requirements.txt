@@ -18,6 +18,3 @@ asyncio
 # БАЗА ДАННЫХ
 psycopg2-binary==2.9.9
 sqlalchemy==2.0.23
-
-# Celery для фоновых задач
-celery==5.3.4

@@ -377,6 +377,7 @@ class BatchUploadRequest(BaseModel):
             raise ValueError('works cannot be empty')
         return v
 
+
 class BatchUploadResponse(BaseModel):
     """Ответ на пакетную загрузку"""
     batch_id: str
@@ -384,6 +385,12 @@ class BatchUploadResponse(BaseModel):
     queue_position: int
     estimated_wait_seconds: int
     status: str = "queued"
+    task_ids: List[str] = []
+    failed_files: Optional[List[Dict[str, str]]] = None
+    partial_success: Optional[bool] = False
+    message: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
 
 class QueueItemStatus(BaseModel):
     """Статус элемента в очереди"""
