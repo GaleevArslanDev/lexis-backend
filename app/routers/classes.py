@@ -177,7 +177,17 @@ def list_students_in_class(
         return []
 
     students = session.exec(select(User).where(User.id.in_(student_ids))).all()
-    return [{"id": s.id, "email": s.email, "role": s.role} for s in students]
+    return [
+        {
+            "id": s.id,
+            "email": s.email,
+            "name": s.name,
+            "surname": s.surname,
+            "role": s.role,
+            "created_at": s.created_at.isoformat() if s.created_at else None
+        }
+        for s in students
+    ]
 
 
 @router.get("/{class_id}/assignments", response_model=list[dict])
