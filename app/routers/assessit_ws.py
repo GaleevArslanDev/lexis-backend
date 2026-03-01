@@ -9,7 +9,7 @@ from jose import jwt
 import uuid
 import time
 
-from ..db import get_session
+from ..db import get_session, engine
 from ..models import User, Class, AssessmentImage, RecognizedSolution, Assignment
 from ..utils.security import SECRET_KEY, ALGORITHM
 from ..exceptions import AppException, ErrorCode
@@ -19,6 +19,12 @@ from ..crud.assessment import (
     create_recognized_solution_v1,
     get_recognized_solution
 )
+
+def get_db_session():
+    """Создать временную сессию БД"""
+    from sqlmodel import Session
+    from ..db import engine
+    return Session(engine)
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +164,32 @@ class ConnectionManager:
         Добавить несколько работ в очередь
         Возвращает позицию первого элемента
         """
+        # Гарантируем, что все структуры данных существуют
+        if class_id not in self.queue_locks:
+            self.queue_locks[class_id] = asyncio.Lock()
+        if class_id not in self.queue_items:
+            self.queue_items[class_id] = []
+        if class_id not in self.class_queues:
+            self.class_queues[class_id] = asyncio.Queue()
+        if class_id not in self.processing_stats:
+            self.processing_stats[class_id] = []
+
+        # Запускаем обработчик очереди если его нет
+        if class_id not in self.processing_tasks or self.processing_tasks[class_id].done():
+            if class_id in self.processing_tasks and self.processing_tasks[class_id].done():
+                # Если задача завершилась, удаляем её
+                try:
+                    self.processing_tasks[class_id].result()  # Может выбросить исключение
+                except Exception as e:
+                    logger.error(f"Processor for class {class_id} failed: {e}")
+                del self.processing_tasks[class_id]
+
+            # Запускаем новую
+            self.processing_tasks[class_id] = asyncio.create_task(
+                self.process_queue(class_id)
+            )
+            logger.info(f"Started queue processor for class {class_id} from add_to_queue")
+
         async with self.queue_locks[class_id]:
             current_size = len(self.queue_items[class_id])
 
@@ -166,10 +198,19 @@ class ConnectionManager:
                 self.queue_items[class_id].append(item)
                 await self.class_queues[class_id].put(item)  # Добавляем в asyncio.Queue
 
-                # Обновляем статус в БД
-                from ..crud.assessment import update_image_status
-                with next(get_session()) as session:  # Создаем временную сессию
-                    update_image_status(session, item.work_id, "queued")
+                # Обновляем статус в БД - создаем временную сессию
+                try:
+                    from ..crud.assessment import update_image_status
+                    from ..db import get_session
+
+                    # Создаем временную сессию
+                    with Session(engine) as db_session:
+                        update_image_status(db_session, item.work_id, "queued")
+                        db_session.commit()
+
+                    logger.info(f"Updated DB: work {item.work_id} status = queued")
+                except Exception as e:
+                    logger.error(f"Failed to update DB for work {item.work_id}: {e}")
 
                 logger.info(f"Added work {item.work_id} to queue for class {class_id} at position {item.position}")
 
@@ -237,13 +278,26 @@ class ConnectionManager:
     async def process_queue(self, class_id: int):
         """Фоновая задача для обработки очереди"""
         logger.info(f"Queue processor started for class {class_id}")
+
+        # Гарантируем, что структуры данных существуют
+        if class_id not in self.queue_locks:
+            self.queue_locks[class_id] = asyncio.Lock()
+        if class_id not in self.queue_items:
+            self.queue_items[class_id] = []
+        if class_id not in self.processing_stats:
+            self.processing_stats[class_id] = []
+
         client = get_ocr_client_v1()
 
         while True:
             try:
+                # Проверяем, существует ли еще очередь
+                if class_id not in self.class_queues:
+                    logger.info(f"Queue for class {class_id} no longer exists, stopping processor")
+                    break
+
                 # Ждем элемент из очереди
                 item = await self.class_queues[class_id].get()
-
                 # Обновляем статус
                 async with self.queue_locks[class_id]:
                     item.status = "processing"
