@@ -13,7 +13,7 @@ from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Backgro
 from fastapi.responses import JSONResponse
 from sqlmodel import Session, select
 
-from .. import app
+from .assessit_ws import manager
 from ..crud.queue import get_queue_stats, get_class_queue_items
 from ..db import get_session
 from ..dependencies.auth import get_current_user
@@ -46,6 +46,10 @@ from ..schemas import (
     CommonError, SystemHealthResponse
 )
 from ..workers.queue_worker import get_queue_worker
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from ..main import app
 
 logger = logging.getLogger(__name__)
 
