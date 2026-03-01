@@ -5,7 +5,8 @@ from datetime import datetime
 
 from ..db import get_session
 from ..schemas import AssignmentCreate, AssignmentResponse
-from ..crud.assignment import create_assignment, get_assignment, update_assignment, delete_assignment
+from ..crud.assignment import create_assignment, get_assignment, update_assignment, delete_assignment, \
+    list_assignments_by_class
 from ..crud.logs import log_action
 from ..dependencies_util import require_role, get_current_user
 from ..models import Assignment, User, Class, ClassStudentLink
