@@ -159,6 +159,61 @@ class ConnectionManager:
             self.active_connections.discard(conn)
             self.user_connections[user_id].discard(conn)
 
+    async def get_queue_status(self, class_id: int) -> dict:
+        """Получить детальный статус очереди для класса"""
+        try:
+            from ..db import engine
+            from sqlmodel import Session
+            from ..crud.queue import get_class_queue_items
+
+            with Session(engine) as session:
+                queue_items = get_class_queue_items(session, class_id, limit=50)
+
+                # Получаем статистику
+                pending = sum(1 for item in queue_items if item["status"] == "pending")
+                processing = sum(1 for item in queue_items if item["status"] == "processing")
+                completed = sum(1 for item in queue_items if item["status"] == "completed")
+                failed = sum(1 for item in queue_items if item["status"] == "failed")
+
+                # Преобразуем в формат QueueItemStatus
+                items = []
+                for i, item in enumerate(queue_items):
+                    items.append({
+                        "work_id": item["work_id"],
+                        "student_id": item.get("student_id"),
+                        "student_name": item.get("student_name", "Unknown"),
+                        "position": i + 1,
+                        "status": item["status"],
+                        "queued_at": item["created_at"].isoformat() if item.get("created_at") else None,
+                        "started_at": item["started_at"].isoformat() if item.get("started_at") else None,
+                        "completed_at": item["completed_at"].isoformat() if item.get("completed_at") else None,
+                        "error": item.get("error")
+                    })
+
+                return {
+                    "queue_size": len(queue_items),
+                    "pending": pending,
+                    "processing": processing,
+                    "completed": completed,
+                    "failed": failed,
+                    "items": items,
+                    "estimated_wait_seconds": pending * 6,  # 6 секунд на работу
+                    "avg_processing_time": 6.0  # среднее время обработки
+                }
+        except Exception as e:
+            logger.error(f"Error getting queue status: {e}")
+            return {
+                "queue_size": 0,
+                "pending": 0,
+                "processing": 0,
+                "completed": 0,
+                "failed": 0,
+                "items": [],
+                "estimated_wait_seconds": 0,
+                "avg_processing_time": 0,
+                "error": str(e)
+            }
+
     async def _process_class_queue(self, class_id: int):
         """
         Фоновая задача для обработки очереди сообщений класса
