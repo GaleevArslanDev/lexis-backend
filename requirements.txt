@@ -9,7 +9,7 @@ pydantic-settings==2.1.0
 python-multipart==0.0.6
 alembic==1.12.1
 email-validator==2.1.0
-bcrypt==4.0.1  # Используем стабильную версию
+bcrypt==4.0.1
 aiofiles==23.2.1
 requests==2.31.0
 websockets
@@ -18,3 +18,11 @@ asyncio
 # БАЗА ДАННЫХ
 psycopg2-binary==2.9.9
 sqlalchemy==2.0.23
+
+# ML PIPELINE (перенесено из lexis-ocr)
+httpx==0.25.0
+pillow>=10.2.0,<11.0.0
+numpy>=1.24.3,<2.0.0
+tenacity==8.2.3
+loguru==0.7.2
+sympy

@@ -10,198 +10,199 @@ from contextlib import contextmanager
 
 from ..db import engine
 from ..crud.queue import get_next_pending, mark_completed, mark_failed
-from ..ocr_client import get_ocr_client_v1
 from ..crud.assessment import create_recognized_solution_v1
 
 logger = logging.getLogger(__name__)
 
 
 class QueueWorker:
-    """Фоновый воркер для обработки очереди"""
+    """Фоновый воркер для обработки очереди через pipeline_service."""
 
     def __init__(self, worker_id: Optional[str] = None):
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         self.is_running = False
-        self.current_task = None
 
     @contextmanager
     def get_session(self):
-        """Получить сессию БД"""
         with Session(engine) as session:
             yield session
 
-    async def process_item(self, queue_item):
-        """Обработать один элемент очереди"""
+    # ------------------------------------------------------------------
+    # Обработка одного элемента
+    # ------------------------------------------------------------------
 
-        logger.info(f"Worker {self.worker_id} processing queue item {queue_item.id} (image: {queue_item.image_id})")
+    async def process_item(self, queue_item):
+        logger.info(
+            f"Worker {self.worker_id} processing queue item {queue_item.id} "
+            f"(image_id={queue_item.image_id})"
+        )
+
+        # Загружаем данные изображения ДО try, чтобы иметь доступ в except
+        image = None
 
         try:
-            # Получаем данные изображения
+            # --- Получаем данные из БД ---
             with self.get_session() as session:
                 from ..models import AssessmentImage, Assignment
 
                 image = session.get(AssessmentImage, queue_item.image_id)
                 if not image:
-                    raise ValueError(f"Image {queue_item.image_id} not found")
+                    raise ValueError(f"Image {queue_item.image_id} not found in DB")
 
-                # Получаем данные задания
                 assignment = session.get(Assignment, image.assignment_id)
+                reference_answer = assignment.reference_answer if assignment else None
 
-                # Загружаем изображение (нужно хранить в БД или файловой системе)
-                # Здесь предполагаем, что изображения хранятся в файловой системе
-                image_bytes = None
-                if image.original_image_path and os.path.exists(image.original_image_path):
-                    with open(image.original_image_path, 'rb') as f:
-                        image_bytes = f.read()
-                else:
-                    # Если файла нет, можно хранить в БД как LargeBinary
-                    # Для простоты пока пропускаем
-                    raise ValueError(f"Image file not found: {image.original_image_path}")
+            # --- Проверяем наличие файла ---
+            if not image.original_image_path or not os.path.exists(image.original_image_path):
+                raise ValueError(
+                    f"Image file not found on disk: {image.original_image_path!r}. "
+                    "Возможно, /tmp был очищен после рестарта контейнера."
+                )
 
-            # Отправляем на OCR
-            client = get_ocr_client_v1()
-            result = client.assess_solution(
-                image_bytes=image_bytes,
-                filename=image.file_name,
-                reference_answer=assignment.reference_answer if assignment else None,
-                reference_formulas=[
-                    assignment.reference_solution] if assignment and assignment.reference_solution else None
+            # --- Запускаем ML-пайплайн напрямую (без HTTP) ---
+            from ..processing.pipeline_service import pipeline_service
+            from ..processing.schemas import OCRRequest
+
+            request = OCRRequest(
+                image_path=image.original_image_path,
+                reference_answer=reference_answer,
             )
 
-            if result.get("success") and result.get("assessment"):
-                assessment = result["assessment"]
+            logger.info(f"Queue item {queue_item.id}: calling pipeline_service...")
+            response = await pipeline_service.process_assessment(request)
 
-                # Сохраняем результат
+            if response.success and response.assessment:
+                assessment = response.assessment
+                # Сериализуем в dict (mode='json' преобразует datetime → str)
+                assessment_dict = assessment.model_dump(mode='json')
+
                 with self.get_session() as session:
                     solution = create_recognized_solution_v1(
                         session=session,
                         image_id=queue_item.image_id,
-                        assessment_data=assessment
+                        assessment_data=assessment_dict,
                     )
-
-                    # Отмечаем как выполненное
                     mark_completed(
                         session,
                         queue_item.id,
                         {
                             "solution_id": solution.id,
-                            "confidence": assessment.get("confidence_score"),
-                            "mark_score": assessment.get("mark_score")
-                        }
+                            "confidence_score": assessment.confidence_score,
+                            "mark_score": assessment.mark_score,
+                            "confidence_level": assessment.confidence_level,
+                        },
                     )
 
-                    # Отправляем уведомление через WebSocket
-                    await self.send_notification(
-                        class_id=image.class_id,
-                        work_id=queue_item.image_id,
-                        status="completed",
-                        data=assessment
-                    )
-
-                logger.info(f"✅ Successfully processed queue item {queue_item.id}")
+                await self._send_notification(
+                    class_id=image.class_id,
+                    work_id=queue_item.image_id,
+                    status="completed",
+                    data=assessment_dict,
+                )
+                logger.info(f"✅ Queue item {queue_item.id} processed successfully")
 
             else:
-                error_msg = result.get("error", "Unknown OCR error")
-                raise Exception(error_msg)
+                raise Exception(response.error or "Pipeline returned no result")
 
         except Exception as e:
-            logger.error(f"❌ Error processing queue item {queue_item.id}: {e}")
+            logger.error(f"❌ Error processing queue item {queue_item.id}: {e}", exc_info=True)
 
             with self.get_session() as session:
                 should_retry = queue_item.retry_count < queue_item.max_retries - 1
                 mark_failed(session, queue_item.id, str(e), should_retry)
 
-                # Отправляем уведомление об ошибке
-                await self.send_notification(
-                    class_id=image.class_id if 'image' in locals() else None,
-                    work_id=queue_item.image_id,
-                    status="failed",
-                    error=str(e)
-                )
+            await self._send_notification(
+                class_id=image.class_id if image else None,
+                work_id=queue_item.image_id,
+                status="failed",
+                error=str(e),
+            )
 
-    async def send_notification(self, class_id: Optional[int], work_id: int, status: str, data: dict = None,
-                                error: str = None):
-        """Отправить уведомление через WebSocket"""
+    # ------------------------------------------------------------------
+    # WebSocket уведомление
+    # ------------------------------------------------------------------
+
+    async def _send_notification(
+        self,
+        class_id: Optional[int],
+        work_id: int,
+        status: str,
+        data: dict = None,
+        error: str = None,
+    ):
+        if not class_id:
+            return
         try:
             from ..routers.assessit_ws import manager
 
-            if class_id:
-                message = {
-                    "type": "work_status_update",
-                    "data": {
-                        "work_id": work_id,
-                        "status": status,
-                        "timestamp": datetime.utcnow().isoformat()
-                    }
-                }
+            message = {
+                "type": "work_status_update",
+                "data": {
+                    "work_id": work_id,
+                    "status": status,
+                    "timestamp": datetime.utcnow().isoformat(),
+                },
+            }
 
-                if data:
-                    message["data"].update({
-                        "confidence_score": data.get("confidence_score"),
-                        "check_level": f"level_{data.get('confidence_level', 3)}",
-                        "mark_score": data.get("mark_score")
-                    })
+            if data:
+                message["data"].update({
+                    "confidence_score": data.get("confidence_score"),
+                    "confidence_level": data.get("confidence_level"),
+                    "check_level": f"level_{data.get('confidence_level', 3)}",
+                    "mark_score": data.get("mark_score"),
+                    "teacher_comment": data.get("teacher_comment"),
+                })
 
-                if error:
-                    message["data"]["error"] = error
+            if error:
+                message["data"]["error"] = error
 
-                await manager.broadcast_to_class(class_id, message)
+            await manager.broadcast_to_class(class_id, message)
 
         except Exception as e:
-            logger.error(f"Failed to send notification: {e}")
+            logger.error(f"Failed to send WebSocket notification: {e}")
 
-    async def run_once(self, batch_size: int = 5):
-        """Выполнить один цикл обработки"""
+    # ------------------------------------------------------------------
+    # Основной цикл
+    # ------------------------------------------------------------------
 
-        worker_id = self.worker_id
-
+    async def run_once(self, batch_size: int = 5) -> int:
         with self.get_session() as session:
-            items = get_next_pending(session, worker_id, batch_size)
+            items = get_next_pending(session, self.worker_id, batch_size)
 
         if not items:
             return 0
 
-        logger.info(f"Worker {worker_id} got {len(items)} items to process")
-
+        logger.info(f"Worker {self.worker_id}: got {len(items)} items")
         for item in items:
             await self.process_item(item)
 
         return len(items)
 
     async def run_forever(self, sleep_seconds: int = 2):
-        """Запустить бесконечный цикл обработки"""
-
         self.is_running = True
         logger.info(f"🚀 Worker {self.worker_id} started")
 
         while self.is_running:
             try:
                 processed = await self.run_once()
-
-                if processed == 0:
-                    # Нет задач - спим
-                    await asyncio.sleep(sleep_seconds)
-                else:
-                    # Были задачи - проверяем сразу еще
-                    await asyncio.sleep(0.5)
-
+                await asyncio.sleep(0.5 if processed > 0 else sleep_seconds)
             except Exception as e:
-                logger.error(f"Error in worker loop: {e}")
+                logger.error(f"Error in worker loop: {e}", exc_info=True)
                 await asyncio.sleep(5)
 
         logger.info(f"🛑 Worker {self.worker_id} stopped")
 
     def stop(self):
-        """Остановить воркер"""
         self.is_running = False
 
 
-# Глобальный экземпляр воркера
-_queue_worker = None
+# ---------------------------------------------------------------------------
+# Глобальный singleton
+# ---------------------------------------------------------------------------
+_queue_worker: Optional[QueueWorker] = None
 
 
 def get_queue_worker() -> QueueWorker:
-    """Получить или создать экземпляр воркера"""
     global _queue_worker
     if _queue_worker is None:
         _queue_worker = QueueWorker()

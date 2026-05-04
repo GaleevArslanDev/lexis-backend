@@ -1,12 +1,13 @@
 import json
+from datetime import datetime
 
 from sqlmodel import Session, select, func, desc
 from typing import Optional, List, Dict, Any
-from datetime import datetime, timedelta
 from ..models import (
     AssessmentImage, RecognizedSolution, AssessmentResult,
     TrainingSample, SystemMetrics, User, Class, Assignment
 )
+
 
 def create_recognized_solution_v1(
         session: Session,
@@ -14,67 +15,87 @@ def create_recognized_solution_v1(
         assessment_data: Dict[str, Any]
 ) -> RecognizedSolution:
     """
-    Создать запись о распознанном решении из данных ML API v1
-    
-    Args:
-        session: Сессия БД
-        image_id: ID изображения
-        assessment_data: Данные из поля assessment ответа ML API
+    Создать запись о распознанном решении из данных ML-пайплайна.
+
+    assessment_data — результат FinalAssessment.model_dump(mode='json').
+    Совместим как с dict-ответом старого HTTP OCR API, так и с новым
+    прямым вызовом pipeline_service.
     """
-    # Извлекаем данные
     scores = assessment_data.get("scores", {})
     steps = assessment_data.get("steps_analysis", [])
-    
-    # Конвертируем check_level из числа в строку
+
+    # Уровень проверки: числовой (1/2/3) → строка
     confidence_level = assessment_data.get("confidence_level", 3)
-    check_level_map = {
-        1: "level_1",
-        2: "level_2",
-        3: "level_3"
-    }
+    check_level_map = {1: "level_1", 2: "level_2", 3: "level_3"}
     check_level = check_level_map.get(confidence_level, "level_3")
-    
+
+    # Извлечённый текст: ищем ключ "formula" (новый пайплайн) или "found_formula" (старый API)
+    extracted_texts = [
+        item.get("formula") or item.get("found_formula", "")
+        for item in steps
+    ] if steps else []
+
+    # Время обработки
+    execution_time = assessment_data.get("execution_time", 0) or 0
+    processing_time_ms = int(execution_time * 1000)
+
+    # Дата распознавания — может прийти как str или datetime
+    created_at_raw = assessment_data.get("created_at")
+    if created_at_raw is None:
+        recognized_at = datetime.utcnow()
+    elif isinstance(created_at_raw, datetime):
+        recognized_at = created_at_raw
+    else:
+        try:
+            recognized_at = datetime.fromisoformat(str(created_at_raw))
+        except (ValueError, TypeError):
+            recognized_at = datetime.utcnow()
+
     solution = RecognizedSolution(
         image_id=image_id,
-        extracted_text=json.dumps([item.get("found_formula", "") for item in steps] if steps else [], ensure_ascii=False),
-        text_confidence=scores.get("c_ocr", 0.0) * 100,  # Конвертируем в проценты
+        extracted_text=json.dumps(extracted_texts, ensure_ascii=False),
+        text_confidence=(scores.get("c_ocr") or 0.0) * 100,
         formulas_count=len(steps) if steps else 0,
-        
+
         # Confidence scores
         ocr_confidence=scores.get("c_ocr", 0.0),
-        formula_confidence=scores.get("c_llm", 0.0),  # Используем c_llm как formula_confidence
+        formula_confidence=scores.get("c_llm", 0.0),
         answer_match_confidence=scores.get("m_answer", 0.0),
         total_confidence=assessment_data.get("confidence_score", 0.0),
-        
+
         # Классификация
         check_level=check_level,
-        suggested_grade=assessment_data.get("mark_score", 0.0) * 5,  # Конвертируем в 5-балльную
+        suggested_grade=(assessment_data.get("mark_score") or 0.0) * 5,  # → 5-балльная
         auto_feedback=assessment_data.get("teacher_comment", ""),
-        
-        # Новые поля
+
+        # Поля из нового пайплайна
         solution_id=assessment_data.get("solution_id"),
         mark_score=assessment_data.get("mark_score", 0.0),
         teacher_comment=assessment_data.get("teacher_comment", ""),
-        
-        # Детальные скоринг-метрики
+
+        # Детальные метрики
         c_ocr=scores.get("c_ocr"),
         c_llm=scores.get("c_llm"),
-        m_sympy=scores.get("m_sympy"),
+        m_sympy=scores.get("m_sympy"),   # None в новом пайплайне — это нормально
         m_llm=scores.get("m_llm"),
         m_answer=scores.get("m_answer"),
-        
-        # Шаги анализа
+
+        # Анализ шагов
         steps_analysis_json=json.dumps(steps, ensure_ascii=False) if steps else None,
-        
-        processing_time_ms=assessment_data.get("execution_time", 0) * 1000,  # Конвертируем в мс
-        recognized_at=datetime.fromisoformat(assessment_data.get("created_at", datetime.utcnow().isoformat()))
+
+        processing_time_ms=processing_time_ms,
+        recognized_at=recognized_at,
     )
-    
+
     session.add(solution)
     session.commit()
     session.refresh(solution)
     return solution
 
+
+# ---------------------------------------------------------------------------
+# Остальные функции без изменений
+# ---------------------------------------------------------------------------
 
 def create_assessment_image(
         session: Session,
@@ -86,27 +107,22 @@ def create_assessment_image(
         class_id: Optional[int] = None,
         question_id: Optional[int] = None
 ) -> AssessmentImage:
-    """Создать запись о загруженной работе (без сохранения файла)"""
-
-    # Если есть class_id, получаем его из assignment
     if not class_id:
         assignment = session.get(Assignment, assignment_id)
         if assignment:
             class_id = assignment.class_id
 
-    # Создаем запись без пути к файлу
     image = AssessmentImage(
         assignment_id=assignment_id,
         class_id=class_id,
         student_id=student_id,
         question_id=question_id,
-        original_image_path="",  # Пусто, так как файл не сохраняем
+        original_image_path="",
         file_name=file_name,
         file_size=file_size,
         mime_type=mime_type,
-        status="pending"
+        status="pending",
     )
-
     session.add(image)
     session.commit()
     session.refresh(image)
@@ -114,7 +130,6 @@ def create_assessment_image(
 
 
 def get_assessment_image(session: Session, image_id: int) -> Optional[AssessmentImage]:
-    """Получить работу по ID"""
     return session.get(AssessmentImage, image_id)
 
 
@@ -124,7 +139,6 @@ def update_image_status(
         status: str,
         error_message: Optional[str] = None
 ) -> Optional[AssessmentImage]:
-    """Обновить статус обработки работы"""
     image = session.get(AssessmentImage, image_id)
     if not image:
         return None
@@ -150,59 +164,36 @@ def create_recognized_solution(
         extracted_text: str,
         **kwargs
 ) -> RecognizedSolution:
-    """Создать запись о распознанном решении"""
-
-    solution = RecognizedSolution(
-        image_id=image_id,
-        extracted_text=extracted_text,
-        **kwargs
-    )
-
+    solution = RecognizedSolution(image_id=image_id, extracted_text=extracted_text, **kwargs)
     session.add(solution)
     session.commit()
     session.refresh(solution)
     return solution
 
 
-def get_recognized_solution(
-        session: Session,
-        image_id: int
-) -> Optional[RecognizedSolution]:
-    """Получить распознанное решение по ID изображения"""
-    statement = select(RecognizedSolution).where(
-        RecognizedSolution.image_id == image_id
-    ).order_by(desc(RecognizedSolution.recognized_at))
-
+def get_recognized_solution(session: Session, image_id: int) -> Optional[RecognizedSolution]:
+    statement = (
+        select(RecognizedSolution)
+        .where(RecognizedSolution.image_id == image_id)
+        .order_by(desc(RecognizedSolution.recognized_at))
+    )
     return session.exec(statement).first()
 
 
-def create_assessment_result(
-        session: Session,
-        solution_id: int,
-        **kwargs
-) -> AssessmentResult:
-    """Создать результат проверки"""
-
-    result = AssessmentResult(
-        solution_id=solution_id,
-        **kwargs
-    )
-
+def create_assessment_result(session: Session, solution_id: int, **kwargs) -> AssessmentResult:
+    result = AssessmentResult(solution_id=solution_id, **kwargs)
     session.add(result)
     session.commit()
     session.refresh(result)
     return result
 
 
-def get_assessment_result(
-        session: Session,
-        solution_id: int
-) -> Optional[AssessmentResult]:
-    """Получить результат проверки по ID решения"""
-    statement = select(AssessmentResult).where(
-        AssessmentResult.solution_id == solution_id
-    ).order_by(desc(AssessmentResult.created_at))
-
+def get_assessment_result(session: Session, solution_id: int) -> Optional[AssessmentResult]:
+    statement = (
+        select(AssessmentResult)
+        .where(AssessmentResult.solution_id == solution_id)
+        .order_by(desc(AssessmentResult.created_at))
+    )
     return session.exec(statement).first()
 
 
@@ -215,27 +206,14 @@ def get_class_assessments(
         limit: int = 100,
         offset: int = 0
 ) -> List[AssessmentImage]:
-    """Получить все работы класса"""
-
-    statement = select(AssessmentImage).where(
-        AssessmentImage.class_id == class_id
-    )
-
+    statement = select(AssessmentImage).where(AssessmentImage.class_id == class_id)
     if assignment_id:
         statement = statement.where(AssessmentImage.assignment_id == assignment_id)
-
     if status:
         statement = statement.where(AssessmentImage.status == status)
-
-    # Фильтр по check_level требует join с RecognizedSolution
     if check_level:
-        statement = statement.join(RecognizedSolution).where(
-            RecognizedSolution.check_level == check_level
-        )
-
-    statement = statement.order_by(desc(AssessmentImage.upload_time))
-    statement = statement.offset(offset).limit(limit)
-
+        statement = statement.join(RecognizedSolution).where(RecognizedSolution.check_level == check_level)
+    statement = statement.order_by(desc(AssessmentImage.upload_time)).offset(offset).limit(limit)
     return session.exec(statement).all()
 
 
@@ -244,33 +222,23 @@ def get_class_assessment_summary(
         class_id: int,
         assignment_id: Optional[int] = None
 ) -> Dict[str, Any]:
-    """Получить сводку по работам класса"""
-
-    # Базовый запрос для работ
-    base_query = select(AssessmentImage).where(
-        AssessmentImage.class_id == class_id
-    )
-
+    base_query = select(AssessmentImage).where(AssessmentImage.class_id == class_id)
     if assignment_id:
         base_query = base_query.where(AssessmentImage.assignment_id == assignment_id)
 
     all_works = session.exec(base_query).all()
-
     if not all_works:
         return {
-            "total_works": 0,
-            "processed_works": 0,
+            "total_works": 0, "processed_works": 0,
             "level_counts": {"level_1": 0, "level_2": 0, "level_3": 0},
-            "avg_confidence": None
+            "avg_confidence": None,
         }
 
     total_works = len(all_works)
     processed_works = len([w for w in all_works if w.status == "processed"])
 
-    # Получаем уровни проверки
     level_counts = {"level_1": 0, "level_2": 0, "level_3": 0}
     confidences = []
-
     for work in all_works:
         if work.status == "processed":
             solution = get_recognized_solution(session, work.id)
@@ -280,12 +248,11 @@ def get_class_assessment_summary(
                     confidences.append(solution.total_confidence)
 
     avg_confidence = sum(confidences) / len(confidences) if confidences else None
-
     return {
         "total_works": total_works,
         "processed_works": processed_works,
         "level_counts": level_counts,
-        "avg_confidence": avg_confidence
+        "avg_confidence": avg_confidence,
     }
 
 
@@ -296,48 +263,32 @@ def create_training_sample(
         corrected_text: str,
         **kwargs
 ) -> TrainingSample:
-    """Создать образец для дообучения"""
-
     sample = TrainingSample(
-        image_path=image_path,
-        original_text=original_text,
-        corrected_text=corrected_text,
-        **kwargs
+        image_path=image_path, original_text=original_text,
+        corrected_text=corrected_text, **kwargs
     )
-
     session.add(sample)
     session.commit()
     session.refresh(sample)
     return sample
 
 
-def update_system_metrics(
-        session: Session,
-        **kwargs
-) -> SystemMetrics:
-    """Обновить метрики системы"""
+def update_system_metrics(session: Session, **kwargs) -> SystemMetrics:
+    from sqlmodel import func as sqlfunc
+    from datetime import date
 
     today = datetime.utcnow().date()
-
-    # Ищем запись за сегодня
-    statement = select(SystemMetrics).where(
-        func.date(SystemMetrics.date) == today
-    )
-
+    statement = select(SystemMetrics).where(func.date(SystemMetrics.date) == today)
     metrics = session.exec(statement).first()
-
     if not metrics:
         metrics = SystemMetrics()
 
-    # Обновляем поля
     for key, value in kwargs.items():
         if hasattr(metrics, key):
-            current_value = getattr(metrics, key)
-            if isinstance(current_value, (int, float)) and isinstance(value, (int, float)):
-                # Для числовых полей можно суммировать
-                if key in ["total_processed", "level_1_count", "level_2_count",
-                           "level_3_count", "error_count"]:
-                    setattr(metrics, key, current_value + value)
+            current = getattr(metrics, key)
+            if isinstance(current, (int, float)) and isinstance(value, (int, float)):
+                if key in ["total_processed", "level_1_count", "level_2_count", "level_3_count", "error_count"]:
+                    setattr(metrics, key, current + value)
                 else:
                     setattr(metrics, key, value)
             else:
@@ -354,233 +305,32 @@ def get_teacher_dashboard_stats(
         teacher_id: int,
         days: int = 30
 ) -> Dict[str, Any]:
-    """Получить статистику для дашборда учителя"""
-
-    # Получаем классы учителя
-    statement = select(Class).where(Class.teacher_id == teacher_id)
-    classes = session.exec(statement).all()
-
-    if not classes:
-        return {"error": "No classes found"}
-
-    class_ids = [c.id for c in classes]
-
-    # Работы за последние N дней
-    cutoff_date = datetime.utcnow() - timedelta(days=days)
-
-    works_statement = select(AssessmentImage).where(
-        AssessmentImage.class_id.in_(class_ids),
-        AssessmentImage.upload_time >= cutoff_date
-    )
-
-    works = session.exec(works_statement).all()
-
-    # Обработанные работы
-    processed_works = [w for w in works if w.status == "processed"]
-
-    # Считаем метрики
-    total_works = len(works)
-    processed_count = len(processed_works)
-
-    # Confidence scores
-    confidences = []
-    for work in processed_works:
-        solution = get_recognized_solution(session, work.id)
-        if solution and solution.total_confidence:
-            confidences.append(solution.total_confidence)
-
-    avg_confidence = sum(confidences) / len(confidences) if confidences else 0
-
-    # Распределение по дням
-    daily_stats = {}
-    for work in works:
-        day = work.upload_time.date().isoformat()
-        if day not in daily_stats:
-            daily_stats[day] = {"total": 0, "processed": 0}
-
-        daily_stats[day]["total"] += 1
-        if work.status == "processed":
-            daily_stats[day]["processed"] += 1
-
-    daily_stats_list = [
-        {"date": day, "total": stats["total"], "processed": stats["processed"]}
-        for day, stats in daily_stats.items()
-    ]
-
-    # Оцениваем сэкономленное время (предполагаем 3 минуты на ручную проверку)
-    time_saved_minutes = processed_count * 3
-    time_saved_hours = time_saved_minutes / 60
-
-    return {
-        "total_works": total_works,
-        "processed_works": processed_count,
-        "time_saved_hours": round(time_saved_hours, 1),
-        "avg_confidence": round(avg_confidence, 2),
-        "accuracy_rate": round(processed_count / total_works * 100, 1) if total_works > 0 else 0,
-        "daily_stats": daily_stats_list
-    }
-
-
-def get_class_assessments_paginated(
-        session: Session,
-        class_id: int,
-        assignment_id: Optional[int] = None,
-        status: Optional[str] = None,
-        check_level: Optional[str] = None,
-        page: int = 1,
-        page_size: int = 20
-) -> Dict[str, Any]:
-    """Получить работы класса с пагинацией"""
-
-    # Базовый запрос
-    query = select(AssessmentImage).where(AssessmentImage.class_id == class_id)
-
-    if assignment_id:
-        query = query.where(AssessmentImage.assignment_id == assignment_id)
-
-    if status:
-        query = query.where(AssessmentImage.status == status)
-
-    # Сначала считаем общее количество
-    count_query = select(func.count()).select_from(query.subquery())
-    total = session.exec(count_query).one()
-
-    # Добавляем сортировку и пагинацию
-    query = query.order_by(desc(AssessmentImage.upload_time))
-    query = query.offset((page - 1) * page_size).limit(page_size)
-
-    works = session.exec(query).all()
-
-    # Обогащаем данными о студентах и решениях
-    result = []
-    for work in works:
-        student = session.get(User, work.student_id)
-        solution = get_recognized_solution(session, work.id)
-
-        result.append({
-            "work_id": work.id,
-            "student_id": work.student_id,
-            "student_name": student.name if student else "Unknown",
-            "student_surname": student.surname if student else "",
-            "status": work.status,
-            "check_level": solution.check_level if solution else None,
-            "confidence_score": solution.total_confidence if solution else None,
-            "teacher_score": None,  # Заполняется из AssessmentResult
-            "system_score": solution.suggested_grade if solution else None,
-            "uploaded_at": work.upload_time,
-            "processed_at": solution.recognized_at if solution else None
-        })
-
-    return {
-        "items": result,
-        "pagination": {
-            "page": page,
-            "page_size": page_size,
-            "total": total,
-            "total_pages": (total + page_size - 1) // page_size,
-            "has_next": page * page_size < total,
-            "has_prev": page > 1
-        }
-    }
-
-
-def get_common_mistakes(
-        session: Session,
-        class_id: int,
-        assignment_id: Optional[int] = None,
-        limit: int = 10
-) -> List[Dict[str, Any]]:
-    """Анализ типичных ошибок класса"""
-
-    # Получаем все решения для класса
-    query = (
-        select(RecognizedSolution)
-        .join(AssessmentImage)
-        .where(AssessmentImage.class_id == class_id)
-    )
-
-    if assignment_id:
-        query = query.where(AssessmentImage.assignment_id == assignment_id)
-
-    solutions = session.exec(query).all()
-
-    mistakes = {}
-    examples = {}
-
-    for sol in solutions:
-        if sol.steps_analysis_json:
-            steps = json.loads(sol.steps_analysis_json)
-            for step in steps:
-                if not step.get("is_correct", True):
-                    mistake_type = step.get("expected_formula", "unknown")
-                    found = step.get("found_formula", "")
-
-                    if mistake_type not in mistakes:
-                        mistakes[mistake_type] = 0
-                        examples[mistake_type] = []
-
-                    mistakes[mistake_type] += 1
-
-                    # Сохраняем примеры (не больше 3)
-                    if len(examples[mistake_type]) < 3 and found:
-                        examples[mistake_type].append(found)
-
-    # Сортируем по частоте
-    sorted_mistakes = sorted(mistakes.items(), key=lambda x: x[1], reverse=True)[:limit]
-    total = sum(mistakes.values()) or 1  # избегаем деления на 0
-
-    result = []
-    for mistake_type, count in sorted_mistakes:
-        result.append({
-            "error_type": mistake_type,
-            "count": count,
-            "percentage": round((count / total) * 100, 1),
-            "examples": examples.get(mistake_type, [])
-        })
-
-    return result
-
-
-def get_teacher_dashboard_stats(
-        session: Session,
-        teacher_id: int,
-        days: int = 30
-) -> Dict[str, Any]:
-    """Получить статистику для дашборда учителя"""
+    from datetime import timedelta
 
     cutoff_date = datetime.utcnow() - timedelta(days=days)
 
-    # Получаем классы учителя
     classes = session.exec(select(Class).where(Class.teacher_id == teacher_id)).all()
     class_ids = [c.id for c in classes]
 
     if not class_ids:
         return {
-            "total_assignments": 0,
-            "total_works_processed": 0,
-            "time_saved_hours": 0,
-            "avg_confidence": 0,
-            "accuracy_rate": 0,
-            "daily_stats": []
+            "total_assignments": 0, "total_works_processed": 0,
+            "time_saved_hours": 0, "avg_confidence": 0,
+            "accuracy_rate": 0, "daily_stats": [],
         }
 
-    # Все работы за период
     works = session.exec(
         select(AssessmentImage)
         .where(AssessmentImage.class_id.in_(class_ids))
         .where(AssessmentImage.upload_time >= cutoff_date)
     ).all()
 
-    # Все задания
     assignments = session.exec(
-        select(Assignment)
-        .where(Assignment.class_id.in_(class_ids))
+        select(Assignment).where(Assignment.class_id.in_(class_ids))
     ).all()
 
-    # Обработанные работы
     processed_works = [w for w in works if w.status == "processed"]
 
-    # Считаем confidence
     confidences = []
     for work in processed_works:
         sol = get_recognized_solution(session, work.id)
@@ -589,35 +339,25 @@ def get_teacher_dashboard_stats(
 
     avg_confidence = sum(confidences) / len(confidences) if confidences else 0
 
-    # Дневная статистика
-    daily = {}
+    daily: Dict[str, Dict] = {}
     for work in works:
         day = work.upload_time.date().isoformat()
         if day not in daily:
             daily[day] = {"total": 0, "processed": 0, "errors": 0}
-
         daily[day]["total"] += 1
         if work.status == "processed":
             daily[day]["processed"] += 1
         elif work.status == "error":
             daily[day]["errors"] += 1
 
-    daily_stats = [
-        {"date": day, **stats}
-        for day, stats in sorted(daily.items())
-    ]
+    daily_stats = [{"date": day, **stats} for day, stats in sorted(daily.items())]
 
-    # Экономия времени (3 минуты на работу)
-    time_saved_minutes = len(processed_works) * 3
-    time_saved_hours = time_saved_minutes / 60
+    time_saved_hours = len(processed_works) * 3 / 60
 
-    # Точность (процент level_1)
-    level_1_count = 0
-    for work in processed_works:
-        sol = get_recognized_solution(session, work.id)
-        if sol and sol.check_level == "level_1":
-            level_1_count += 1
-
+    level_1_count = sum(
+        1 for w in processed_works
+        if (sol := get_recognized_solution(session, w.id)) and sol.check_level == "level_1"
+    )
     accuracy_rate = (level_1_count / len(processed_works) * 100) if processed_works else 0
 
     return {
@@ -626,7 +366,7 @@ def get_teacher_dashboard_stats(
         "time_saved_hours": round(time_saved_hours, 1),
         "avg_confidence": round(avg_confidence, 2),
         "accuracy_rate": round(accuracy_rate, 1),
-        "daily_stats": daily_stats
+        "daily_stats": daily_stats,
     }
 
 
@@ -640,14 +380,10 @@ def create_teacher_verification(
         corrected_text: Optional[str] = None,
         corrected_answer: Optional[str] = None
 ) -> AssessmentResult:
-    """Создать результат проверки учителя"""
-
-    # Получаем решение
     solution = session.get(RecognizedSolution, solution_id)
     if not solution:
         raise ValueError(f"Solution {solution_id} not found")
 
-    # Создаем результат
     result = AssessmentResult(
         solution_id=solution_id,
         teacher_id=teacher_id,
@@ -658,28 +394,122 @@ def create_teacher_verification(
         corrected_answer=corrected_answer,
         system_score=solution.suggested_grade,
         system_feedback=solution.auto_feedback,
-        verified_at=datetime.utcnow()
+        verified_at=datetime.utcnow(),
     )
-
     session.add(result)
     session.commit()
     session.refresh(result)
 
-    # Если есть исправления, создаем обучающий пример
     if corrected_text and corrected_text != solution.extracted_text:
-        # Получаем изображение
         image = session.get(AssessmentImage, solution.image_id)
         if image:
-            # Не сохраняем изображение, только метаданные
             training_sample = TrainingSample(
-                image_path="",  # Не сохраняем файл
+                image_path="",
                 original_text=solution.extracted_text,
                 corrected_text=corrected_text,
                 subject=image.assignment.subject if image.assignment else None,
                 handwriting_style="unknown",
-                image_quality="unknown"
+                image_quality="unknown",
             )
             session.add(training_sample)
             session.commit()
 
     return result
+
+
+def get_common_mistakes(
+        session: Session,
+        class_id: int,
+        assignment_id: Optional[int] = None,
+        limit: int = 10
+) -> List[Dict[str, Any]]:
+    query = (
+        select(RecognizedSolution)
+        .join(AssessmentImage)
+        .where(AssessmentImage.class_id == class_id)
+    )
+    if assignment_id:
+        query = query.where(AssessmentImage.assignment_id == assignment_id)
+
+    solutions = session.exec(query).all()
+    mistakes: Dict[str, int] = {}
+    examples: Dict[str, List] = {}
+
+    for sol in solutions:
+        if sol.steps_analysis_json:
+            steps = json.loads(sol.steps_analysis_json)
+            for step in steps:
+                if not step.get("is_correct", True):
+                    mistake_type = step.get("expected_formula") or step.get("formula", "unknown")
+                    found = step.get("found_formula") or step.get("formula", "")
+                    mistakes[mistake_type] = mistakes.get(mistake_type, 0) + 1
+                    if mistake_type not in examples:
+                        examples[mistake_type] = []
+                    if len(examples[mistake_type]) < 3 and found:
+                        examples[mistake_type].append(found)
+
+    sorted_mistakes = sorted(mistakes.items(), key=lambda x: x[1], reverse=True)[:limit]
+    total = sum(mistakes.values()) or 1
+
+    return [
+        {
+            "error_type": mistake_type,
+            "count": count,
+            "percentage": round((count / total) * 100, 1),
+            "examples": examples.get(mistake_type, []),
+        }
+        for mistake_type, count in sorted_mistakes
+    ]
+
+
+def get_class_assessments_paginated(
+        session: Session,
+        class_id: int,
+        assignment_id: Optional[int] = None,
+        status: Optional[str] = None,
+        check_level: Optional[str] = None,
+        page: int = 1,
+        page_size: int = 20
+) -> Dict[str, Any]:
+    query = select(AssessmentImage).where(AssessmentImage.class_id == class_id)
+    if assignment_id:
+        query = query.where(AssessmentImage.assignment_id == assignment_id)
+    if status:
+        query = query.where(AssessmentImage.status == status)
+
+    count_query = select(func.count()).select_from(query.subquery())
+    total = session.exec(count_query).one()
+
+    query = query.order_by(desc(AssessmentImage.upload_time))
+    query = query.offset((page - 1) * page_size).limit(page_size)
+    works = session.exec(query).all()
+
+    result = []
+    for work in works:
+        student = session.get(User, work.student_id)
+        solution = get_recognized_solution(session, work.id)
+        result.append({
+            "work_id": work.id,
+            "student_id": work.student_id,
+            "student_name": student.name if student else "Unknown",
+            "student_surname": student.surname if student else "",
+            "status": work.status,
+            "check_level": solution.check_level if solution else None,
+            "confidence_score": solution.total_confidence if solution else None,
+            "teacher_score": None,
+            "system_score": solution.suggested_grade if solution else None,
+            "uploaded_at": work.upload_time,
+            "processed_at": solution.recognized_at if solution else None,
+        })
+
+    return {
+        "items": result,
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": (total + page_size - 1) // page_size,
+            "has_next": page * page_size < total,
+            "has_prev": page > 1,
+        },
+    }
