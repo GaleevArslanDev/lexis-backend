@@ -219,7 +219,7 @@ class OCRService:
                 confidence=float(step.get("confidence", 0.8)),
                 bbox={"x": 0, "y": 0, "width": 0, "height": 0},
             ))
-            logger.info(f"Step {results[-1].step_id}: '{formula[:60]}' (conf={results[-1].confidence:.2f})")
+            logger.info(f"Step {results[-1].step_id}: '{formula[:60]}' (conf={results[-1].confidence})")
 
         logger.info(f"VLM OCR complete: {len(results)} steps extracted")
         return results

@@ -231,7 +231,7 @@ class PipelineService:
 
         final_answer = ocr_service.extract_final_answer(steps_dicts)
         answer_match = self._check_answer_match(final_answer, request.reference_answer)
-        logger.info(f"[{solution_id}] Final answer: '{final_answer}', match={answer_match:.2f}")
+        logger.info(f"[{solution_id}] Final answer: '{final_answer}', match={answer_match}")
 
         # ШАГ 2: LLM анализ
         llm_timeout = int(os.getenv("OPENROUTER_TIMEOUT", "30"))
@@ -304,10 +304,10 @@ class PipelineService:
             assessment = await self._process_assessment_internal(request, solution_id)
             assessment.execution_time = time.time() - start_time
             logger.info(
-                f"[{solution_id}] Done in {assessment.execution_time:.2f if assessment.execution_time is not None else 'N/A'}s | "
+                f"[{solution_id}] Done in {assessment.execution_time if assessment.execution_time is not None else 'N/A'}s | "
                 f"Level={assessment.confidence_level} "
-                f"Ctotal={assessment.confidence_score:.3f if assessment.confidence_score is not None else 'N/A'} "
-                f"Mtotal={assessment.mark_score:.3f if assessment.mark_score is not None else 'N/A'}"
+                f"Ctotal={assessment.confidence_score if assessment.confidence_score is not None else 'N/A'} "
+                f"Mtotal={assessment.mark_score if assessment.mark_score is not None else 'N/A'}"
             )
             return AssessmentResponse(success=True, assessment=assessment)
 
