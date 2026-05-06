@@ -304,10 +304,10 @@ class PipelineService:
             assessment = await self._process_assessment_internal(request, solution_id)
             assessment.execution_time = time.time() - start_time
             logger.info(
-                f"[{solution_id}] Done in {assessment.execution_time:.2f}s | "
+                f"[{solution_id}] Done in {assessment.execution_time:.2f if assessment.execution_time is not None else 'N/A'}s | "
                 f"Level={assessment.confidence_level} "
-                f"Ctotal={assessment.confidence_score:.3f} "
-                f"Mtotal={assessment.mark_score:.3f}"
+                f"Ctotal={assessment.confidence_score:.3f if assessment.confidence_score is not None else 'N/A'} "
+                f"Mtotal={assessment.mark_score:.3f if assessment.mark_score is not None else 'N/A'}"
             )
             return AssessmentResponse(success=True, assessment=assessment)
 
