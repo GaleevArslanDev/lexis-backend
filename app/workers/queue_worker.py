@@ -27,11 +27,8 @@ class QueueWorker:
         with Session(engine) as session:
             yield session
 
-    # ------------------------------------------------------------------
-    # Обработка одного элемента
-    # ------------------------------------------------------------------
-
     async def process_item(self, queue_item):
+        # Безопасное логирование - используем str() для защиты от format specifier
         logger.info(
             f"Worker {self.worker_id} processing queue item {queue_item.id} "
             f"(image_id={queue_item.image_id})"
@@ -54,8 +51,10 @@ class QueueWorker:
 
             # --- Проверяем наличие файла ---
             if not image.original_image_path or not os.path.exists(image.original_image_path):
+                # Безопасное форматирование пути
+                image_path = image.original_image_path or "None"
                 raise ValueError(
-                    f"Image file not found on disk: {image.original_image_path!r}. "
+                    f"Image file not found on disk: {image_path}. "
                     "Возможно, /tmp был очищен после рестарта контейнера."
                 )
 
@@ -99,28 +98,29 @@ class QueueWorker:
                     status="completed",
                     data=assessment_dict,
                 )
-                logger.info(f"✅ Queue item {queue_item.id} processed successfully")
+                logger.info(f"Queue item {queue_item.id} processed successfully")
 
             else:
-                raise Exception(response.error or "Pipeline returned no result")
+                error_msg = response.error if response.error else "Pipeline returned no result"
+                raise Exception(error_msg)
 
         except Exception as e:
-            logger.error(f"❌ Error processing queue item {queue_item.id}: {e}", exc_info=True)
+            # Безопасное логирование ошибки
+            error_msg = str(e)
+            # Экранируем потенциальные specifier символы
+            safe_error_msg = error_msg.replace('%', '%%') if '%' in error_msg else error_msg
+            logger.error(f"Error processing queue item {queue_item.id}: {safe_error_msg}", exc_info=True)
 
             with self.get_session() as session:
                 should_retry = queue_item.retry_count < queue_item.max_retries - 1
-                mark_failed(session, queue_item.id, str(e), should_retry)
+                mark_failed(session, queue_item.id, safe_error_msg, should_retry)
 
             await self._send_notification(
                 class_id=image.class_id if image else None,
                 work_id=queue_item.image_id,
                 status="failed",
-                error=str(e),
+                error=safe_error_msg,
             )
-
-    # ------------------------------------------------------------------
-    # WebSocket уведомление
-    # ------------------------------------------------------------------
 
     async def _send_notification(
         self,
@@ -161,10 +161,6 @@ class QueueWorker:
         except Exception as e:
             logger.error(f"Failed to send WebSocket notification: {e}")
 
-    # ------------------------------------------------------------------
-    # Основной цикл
-    # ------------------------------------------------------------------
-
     async def run_once(self, batch_size: int = 5) -> int:
         with self.get_session() as session:
             items = get_next_pending(session, self.worker_id, batch_size)
@@ -180,25 +176,23 @@ class QueueWorker:
 
     async def run_forever(self, sleep_seconds: int = 2):
         self.is_running = True
-        logger.info(f"🚀 Worker {self.worker_id} started")
+        logger.info(f"Worker {self.worker_id} started")
 
         while self.is_running:
             try:
                 processed = await self.run_once()
                 await asyncio.sleep(0.5 if processed > 0 else sleep_seconds)
             except Exception as e:
-                logger.error(f"Error in worker loop: {e}", exc_info=True)
+                error_msg = str(e).replace('%', '%%')
+                logger.error(f"Error in worker loop: {error_msg}", exc_info=True)
                 await asyncio.sleep(5)
 
-        logger.info(f"🛑 Worker {self.worker_id} stopped")
+        logger.info(f"Worker {self.worker_id} stopped")
 
     def stop(self):
         self.is_running = False
 
 
-# ---------------------------------------------------------------------------
-# Глобальный singleton
-# ---------------------------------------------------------------------------
 _queue_worker: Optional[QueueWorker] = None
 
 
