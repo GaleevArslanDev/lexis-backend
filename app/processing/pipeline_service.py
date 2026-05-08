@@ -83,9 +83,9 @@ class PipelineService:
 
         c_ocr = float(sum(signals) / len(signals))
         logger.info(
-            f"Cocr signals: steps={signals[0]:.2f} len={signals[1]:.2f} "
-            f"math={signals[2]:.2f} llm_disc={signals[3]:.2f if len(signals) > 3 else 'n/a'} "
-            f"→ Cocr={c_ocr:.3f}"
+            f"Cocr signals: steps={signals[0]} len={signals[1]} "
+            f"math={signals[2]} llm_disc={signals[3] if len(signals) > 3 else 'n/a'} "
+            f"→ Cocr={c_ocr}"
         )
         return c_ocr
 
@@ -120,8 +120,8 @@ class PipelineService:
         m_total = 0.85 * m_llm + 0.15 * m_answer
 
         logger.info(
-            f"Scores — Cocr={c_ocr:.3f} Cllm={c_llm:.3f} → Ctotal={c_total:.3f} | "
-            f"Mllm={m_llm:.3f} Manswer={m_answer:.3f} → Mtotal={m_total:.3f}"
+            f"Scores — Cocr={c_ocr} Cllm={c_llm} → Ctotal={c_total} | "
+            f"Mllm={m_llm} Manswer={m_answer} → Mtotal={m_total}"
         )
         return ConfidenceScores(
             c_ocr=c_ocr, c_llm=c_llm,
@@ -261,10 +261,10 @@ class PipelineService:
             assessment = await self._process_assessment_internal(request, solution_id)
             assessment.execution_time = time.time() - start_time
             logger.info(
-                f"[{solution_id}] Done in {assessment.execution_time:.1f}s | "
+                f"[{solution_id}] Done in {assessment.execution_time}s | "
                 f"Level={assessment.confidence_level} "
-                f"Ctotal={assessment.confidence_score:.3f} "
-                f"Mtotal={assessment.mark_score:.3f}"
+                f"Ctotal={assessment.confidence_score} "
+                f"Mtotal={assessment.mark_score}"
             )
             return AssessmentResponse(success=True, assessment=assessment)
         except asyncio.TimeoutError:
