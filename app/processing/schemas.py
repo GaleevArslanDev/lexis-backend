@@ -10,6 +10,7 @@ from datetime import datetime
 class OCRRequest(BaseModel):
     image_path: str
     reference_answer: Optional[str] = None
+    reference_solution: Optional[str] = None
 
 
 class OCRStepResult(BaseModel):

@@ -65,6 +65,7 @@ class QueueWorker:
             request = OCRRequest(
                 image_path=image.original_image_path,
                 reference_answer=reference_answer,
+                reference_solution=assignment.reference_solution if assignment else None,  # NEW
             )
 
             logger.info(f"Queue item {queue_item.id}: calling pipeline_service...")

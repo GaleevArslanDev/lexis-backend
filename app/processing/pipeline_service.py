@@ -132,11 +132,16 @@ class PipelineService:
     # ------------------------------------------------------------------
     # Классификация
     # ------------------------------------------------------------------
-    def classify_confidence_level(self, c_total: float, m_total: float) -> int:
+    def classify_confidence_level(
+        self,
+        c_total: float,
+        m_total: float,
+        method_match: Optional[bool] = None,    # NEW
+    ) -> int:
         """
-        Level 1 — Автопроверка:   Ctotal >= 0.75 И Mtotal >= 0.55
+        Level 1 — Автопроверка:     Ctotal >= 0.75 И Mtotal >= 0.55
         Level 2 — Требует внимания: Ctotal >= 0.52 ИЛИ Mtotal < 0.55
-        Level 3 — Ручная проверка: всё остальное
+        Level 3 — Ручная проверка:  всё остальное
         """
         if m_total < MARK_ATTENTION_THRESHOLD:
             return 2
@@ -199,7 +204,11 @@ class PipelineService:
         llm_timeout = int(os.getenv("OPENROUTER_TIMEOUT", "30"))
         try:
             llm_result = await asyncio.wait_for(
-                llm_service.analyze_solution(steps_dicts, request.reference_answer or ""),
+                llm_service.analyze_solution(
+                    steps_dicts,
+                    request.reference_answer or "",
+                    request.reference_solution,     # NEW — pass method hint
+                ),
                 timeout=llm_timeout,
             )
         except asyncio.TimeoutError:
@@ -209,11 +218,17 @@ class PipelineService:
             logger.error(f"[{solution_id}] LLM failed: {e}")
             llm_result = None
 
-        # ШАГ 3: Confidence scores
+        method_match = None
+        if llm_result and hasattr(llm_result, 'method_match'):
+            method_match = getattr(llm_result, 'method_match', None)
+ 
+        # Scores (unchanged)
         scores = self.calculate_confidence_scores(ocr_results, llm_result, answer_match)
-
-        # ШАГ 4: Классификация
-        confidence_level = self.classify_confidence_level(scores.c_total, scores.m_total)
+ 
+        # Classification — now aware of method_match
+        confidence_level = self.classify_confidence_level(
+            scores.c_total, scores.m_total, method_match
+        )
         logger.info(f"[{solution_id}] Level={confidence_level}")
 
         # Комментарий

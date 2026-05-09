@@ -46,49 +46,68 @@ class LLMService:
     # Промпт
     # ------------------------------------------------------------------
 
-    def _build_analysis_prompt(self, steps: List[Dict], reference_answer: str) -> str:
+    def _build_analysis_prompt(
+        self,
+        steps: List[Dict],
+        reference_answer: str,
+        reference_solution: Optional[str] = None,   # NEW
+    ) -> str:
         if len(steps) > 40:
             steps = steps[:40]
             logger.warning("Truncated steps to 40 for LLM analysis")
-
+ 
         steps_text = "\n".join([
             f"Шаг {s.get('step_id', i + 1)}: {s.get('formula', '')}"
             for i, s in enumerate(steps)
         ])
-
+ 
+        # Build the optional method block
+        method_block = ""
+        if reference_solution:
+            method_block = (
+                f"\nОжидаемый метод решения (указан учителем): {reference_solution}\n"
+                "Если ученик использовал ИМЕННО этот метод — это считается плюсом и "
+                "должно повышать llm_score. Если метод другой, но результат верный — "
+                "llm_score немного снижается (но не обнуляется).\n"
+            )
+ 
         return f"""Ты - эксперт по математике, анализирующий решение ученика.
-
+ 
 Решение ученика:
 {steps_text}
-
-Эталонный ответ: {reference_answer}
-
+ 
+Эталонный ответ: {reference_answer}{method_block}
+ 
 Проанализируй решение и предоставь ТОЛЬКО JSON ответ со следующими полями:
 1. "reasoning_logic": строка с восстановленной логикой решения (2-3 предложения)
 2. "step_correctness": массив булевых значений для каждого шага (true/false)
 3. "step_explanations": массив строк с краткими объяснениями для каждого шага
 4. "hidden_errors": массив строк со скрытыми ошибками (если нет ошибок, пустой массив)
 5. "teacher_comment": строка с кратким комментарием для учителя (1 предложение)
-6. "llm_score": число от 0.0 до 1.0 (оценка логики и целостности решения)
-7. "ocr_quality_score": число от 0.0 до 1.0 (оценка читаемости рукописи по содержанию — насколько формулы выглядят осмысленно и полно)
+6. "llm_score": число от 0.0 до 1.0 (оценка логики, целостности И соответствия методу)
+7. "ocr_quality_score": число от 0.0 до 1.0 (оценка читаемости рукописи по содержанию)
 8. "confidence": число от 0.0 до 1.0 (уверенность в анализе)
-
+9. "method_match": true/false — использовал ли ученик именно указанный учителем метод
+ 
+Шкала llm_score:
+- 1.0  — всё верно, метод совпадает с ожидаемым
+- 0.85 — всё верно, но метод другой (альтернативный)
+- 0.5–0.7 — есть ошибки, но ход решения понятен
+- 0.0–0.4 — грубые ошибки или решение бессмысленно
+ 
 Пример:
 {{
-    "reasoning_logic": "Ученик правильно решил уравнение.",
+    "reasoning_logic": "Ученик правильно решил уравнение через дискриминант.",
     "step_correctness": [true, true, true],
-    "step_explanations": ["Верно записано уравнение", "Правильный перенос", "Корень найден верно"],
+    "step_explanations": ["Верно записано уравнение", "D вычислен верно", "Корень найден верно"],
     "hidden_errors": [],
-    "teacher_comment": "Решение полностью верное",
+    "teacher_comment": "Решение полностью верное, метод совпадает",
     "llm_score": 1.0,
     "ocr_quality_score": 0.9,
-    "confidence": 0.95
+    "confidence": 0.95,
+    "method_match": true
 }}
-
-Важно для "ocr_quality_score": оценивай НЕ уверенность OCR-движка, а то, насколько
-распознанные формулы выглядят осмысленно. Если формулы похожи на обрывки и символьный мусор —
-ставь низкую оценку. Если формулы структурированы и читаемы — высокую.
-
+ 
 Ответ должен быть ТОЛЬКО валидным JSON, без дополнительного текста.
 """
 
@@ -188,7 +207,12 @@ class LLMService:
     # Публичный API
     # ------------------------------------------------------------------
 
-    async def analyze_solution(self, steps: List[Dict], reference_answer: str) -> LLMAnalysisResult:
+    async def analyze_solution(
+        self,
+        steps: List[Dict],
+        reference_answer: str,
+        reference_solution: Optional[str] = None,   # NEW
+    ) -> LLMAnalysisResult:
         # Нормализуем шаги
         converted = []
         for step in steps:
@@ -207,7 +231,7 @@ class LLMService:
             return LLMAnalysisResult(**fallback)
 
         try:
-            prompt = self._build_analysis_prompt(steps, reference_answer)
+            prompt = self._build_analysis_prompt(steps, reference_answer, reference_solution)
             try:
                 response_text = await asyncio.wait_for(
                     self._call_openrouter(prompt), timeout=OPENROUTER_TIMEOUT
